@@ -1,0 +1,32 @@
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data and outputs (optional; uncomment if you don't want to commit generated data)
+dataset/
+dataset/*.txt
+dataset/*.jsonl
+
+# Resume/progress state for generate_ai_data.py
+*.progress.json
+
+# OS
+.DS_Store
+Thumbs.db

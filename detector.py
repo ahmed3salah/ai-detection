@@ -1,0 +1,352 @@
+"""
+Perplexity (and optional entropy) for AI detection.
+Supports GPT-2 (general) and SciBERT (science-domain); long text via chunking.
+Production detection: paragraph-level decisions + whole-text AI percentage.
+"""
+import re
+from typing import Any, Callable, Dict, List, Optional
+
+import torch
+
+# Default: GPT-2 for backward compatibility and speed
+_GPT2_MODEL = None
+_GPT2_TOKENIZER = None
+_SCIBERT_MODEL = None
+_SCIBERT_TOKENIZER = None
+
+# Chunk size for long texts (SciBERT max 512, GPT-2 we can use 1024)
+MAX_LENGTH = 512
+GPT2_MAX_LENGTH = 1024
+
+
+def _get_gpt2():
+    global _GPT2_MODEL, _GPT2_TOKENIZER
+    if _GPT2_MODEL is None:
+        from transformers import GPT2LMHeadModel, GPT2TokenizerFast
+        _GPT2_TOKENIZER = GPT2TokenizerFast.from_pretrained("gpt2")
+        _GPT2_MODEL = GPT2LMHeadModel.from_pretrained("gpt2")
+        _GPT2_MODEL.eval()
+    return _GPT2_MODEL, _GPT2_TOKENIZER
+
+
+def _get_scibert():
+    global _SCIBERT_MODEL, _SCIBERT_TOKENIZER
+    if _SCIBERT_MODEL is None:
+        from transformers import AutoModelForMaskedLM, AutoTokenizer
+        _SCIBERT_TOKENIZER = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
+        _SCIBERT_MODEL = AutoModelForMaskedLM.from_pretrained("allenai/scibert_scivocab_uncased")
+        _SCIBERT_MODEL.eval()
+    return _SCIBERT_MODEL, _SCIBERT_TOKENIZER
+
+
+def _chunk_text(tokenizer, text, max_length):
+    """Split text into chunks of at most max_length tokens (by sentences when possible)."""
+    enc = tokenizer(text, truncation=False, return_tensors=None, add_special_tokens=False)
+    ids = enc.get("input_ids") or tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) <= max_length:
+        return [text]
+    # Simple token-based chunking
+    chunks = []
+    start = 0
+    while start < len(ids):
+        end = min(start + max_length, len(ids))
+        chunk_ids = ids[start:end]
+        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True)
+        if chunk_text.strip():
+            chunks.append(chunk_text)
+        start = end
+    return chunks if chunks else [text]
+
+
+def calculate_perplexity(text, model_type="gpt2", aggregate="mean"):
+    """
+    Compute perplexity of text (optionally chunked and aggregated).
+
+    Args:
+        text: Input string.
+        model_type: "gpt2" (general) or "scibert" (science-domain).
+        aggregate: For long text, "mean" or "min" over chunk perplexities.
+
+    Returns:
+        float: perplexity value.
+    """
+    text = (text or "").strip()
+    if not text:
+        return float("inf")
+
+    if model_type == "scibert":
+        return _perplexity_scibert(text, aggregate)
+    return _perplexity_gpt2(text, aggregate)
+
+
+def _perplexity_gpt2(text, aggregate):
+    model, tokenizer = _get_gpt2()
+    chunks = _chunk_text(tokenizer, text, GPT2_MAX_LENGTH)
+    perps = []
+    with torch.no_grad():
+        for chunk in chunks:
+            enc = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=GPT2_MAX_LENGTH)
+            if enc["input_ids"].numel() == 0:
+                continue
+            outputs = model(**enc, labels=enc["input_ids"])
+            loss = outputs.loss
+            perps.append(torch.exp(loss).item())
+    if not perps:
+        return float("inf")
+    if aggregate == "min":
+        return min(perps)
+    return sum(perps) / len(perps)
+
+
+def _perplexity_scibert(text, aggregate):
+    """Pseudo-perplexity from MLM: forward with labels=input_ids, perplexity = exp(loss)."""
+    model, tokenizer = _get_scibert()
+    chunks = _chunk_text(tokenizer, text, MAX_LENGTH)
+    perps = []
+    with torch.no_grad():
+        for chunk in chunks:
+            enc = tokenizer(
+                chunk,
+                return_tensors="pt",
+                truncation=True,
+                max_length=MAX_LENGTH,
+                padding="max_length",
+                return_special_tokens_mask=True,
+            )
+            input_ids = enc["input_ids"]
+            # Mask padding and special tokens so we don't count them in loss
+            labels = input_ids.clone()
+            if "attention_mask" in enc:
+                labels[enc["attention_mask"] == 0] = -100
+            if enc.get("special_tokens_mask") is not None:
+                labels[enc["special_tokens_mask"].bool()] = -100
+            # Only pass model-accepted kwargs (no special_tokens_mask)
+            model_kw = {"input_ids": enc["input_ids"], "attention_mask": enc.get("attention_mask"), "labels": labels}
+            if "token_type_ids" in enc:
+                model_kw["token_type_ids"] = enc["token_type_ids"]
+            outputs = model(**model_kw)
+            loss = outputs.loss
+            perps.append(torch.exp(loss).item())
+    if not perps:
+        return float("inf")
+    if aggregate == "min":
+        return min(perps)
+    return sum(perps) / len(perps)
+
+
+def get_perplexity_for_features(text, model_type="scibert", aggregate="mean"):
+    """
+    Return perplexity (and optionally log perplexity) for use as classifier features.
+    Uses science-domain model by default for scientific paper detection.
+    """
+    ppl = calculate_perplexity(text, model_type=model_type, aggregate=aggregate)
+    log_ppl = float("inf") if ppl <= 0 else __import__("math").log(ppl)
+    return ppl, log_ppl
+
+
+# --- Production: paragraph-level detection + whole-text decision ---
+
+# Sentence boundary: period/exclamation/question followed by space and optional quote, then capital or digit
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[\"']?(?:[A-Z0-9]|\d))", re.MULTILINE)
+
+
+def _split_into_sentences(block: str) -> List[str]:
+    """Split a block of text into sentences (regex-based, no spaCy)."""
+    block = (block or "").strip()
+    if not block:
+        return []
+    parts = _SENTENCE_END.split(block)
+    sentences = [s.strip() for s in parts if s.strip()]
+    if not sentences:
+        return [block] if block else []
+    return sentences
+
+
+def split_paragraphs(
+    text: str,
+    min_chars: int = 15,
+    max_paragraph_chars: int = 700,
+    target_sentences_per_chunk: int = 3,
+) -> List[str]:
+    """
+    Split text into paragraphs for analysis.
+    - First splits by double newline (\\n\\n).
+    - Any block longer than max_paragraph_chars is further split by sentence boundaries
+      into chunks of ~target_sentences_per_chunk sentences (so long single-block text
+      gets multiple segments and a more robust overall score).
+    Drops empty or very short blocks.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    raw = [p.strip() for p in text.split("\n\n") if p.strip()]
+    paragraphs: List[str] = []
+
+    for block in raw:
+        if len(block) < min_chars:
+            if len(block) >= max(1, min_chars // 2):
+                paragraphs.append(block)
+            continue
+        if len(block) <= max_paragraph_chars:
+            paragraphs.append(block)
+            continue
+        # Long block: split by sentences into chunks
+        sentences = _split_into_sentences(block)
+        if not sentences:
+            paragraphs.append(block)
+            continue
+        n = target_sentences_per_chunk
+        for i in range(0, len(sentences), n):
+            chunk = " ".join(sentences[i : i + n]).strip()
+            if len(chunk) >= min_chars:
+                paragraphs.append(chunk)
+        if not paragraphs and sentences:
+            # Fallback: one chunk per sentence if very long sentences
+            for s in sentences:
+                if len(s) >= min_chars:
+                    paragraphs.append(s)
+    if not paragraphs and raw:
+        paragraphs = [raw[0]] if len(raw[0]) >= max(1, min_chars // 2) else []
+    if not paragraphs and text:
+        paragraphs = [text] if len(text) >= min_chars else [text] if text else []
+    return paragraphs
+
+
+def _perplexity_to_ai_signal(perplexity: float, ref_perplexity: float = 50.0) -> float:
+    """
+    Map perplexity to a 0–1 "AI-like" signal. Lower perplexity → smoother text → higher signal.
+    ref_perplexity: typical boundary (e.g. 50); below = more AI-like, above = more human-like.
+    """
+    if perplexity <= 0 or ref_perplexity <= 0:
+        return 0.5
+    return 1.0 / (1.0 + perplexity / ref_perplexity)
+
+
+def run_detection(
+    text: str,
+    classifier: Any,
+    build_features_fn: Callable[[str], Any],
+    *,
+    min_paragraph_chars: int = 15,
+    max_paragraph_chars: int = 700,
+    target_sentences_per_chunk: int = 3,
+    decision_threshold: float = 0.5,
+    weight_by_length: bool = True,
+    preview_len: int = 80,
+    use_perplexity: bool = True,
+    perplexity_weight: float = 0.25,
+    ref_perplexity: float = 50.0,
+    perplexity_value: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Run AI detection per paragraph and aggregate to a whole-text decision.
+    Uses both classifier probabilities and perplexity (low ppl → more AI-like).
+    Long single-block text is split by sentences into multiple segments.
+
+    Args:
+        text: Input text (can be multi-paragraph or one long block).
+        classifier: Fitted classifier with predict_proba(X)[:, 1] = P(AI).
+        build_features_fn: Function that takes a string and returns a feature matrix (one row).
+        min_paragraph_chars: Ignore segments shorter than this.
+        max_paragraph_chars: Blocks longer than this are split by sentences.
+        target_sentences_per_chunk: When splitting long blocks, aim for this many sentences per segment.
+        decision_threshold: P(AI) >= this → paragraph/overall labeled "ai".
+        weight_by_length: If True, overall score = length-weighted mean of paragraph probs.
+        preview_len: Max chars of each paragraph to include in response.
+        use_perplexity: If True, blend classifier score with perplexity-based signal.
+        perplexity_weight: Weight of perplexity in final score (0–1); rest is classifier.
+        ref_perplexity: Reference perplexity; below = more AI-like.
+        perplexity_value: If set, use this instead of computing (e.g. from caller).
+
+    Returns:
+        dict with decision, ai_percentage, confidence, paragraphs, raw_overall_prob, perplexity, etc.
+    """
+    paragraphs = split_paragraphs(
+        text,
+        min_chars=min_paragraph_chars,
+        max_paragraph_chars=max_paragraph_chars,
+        target_sentences_per_chunk=target_sentences_per_chunk,
+    )
+    if not paragraphs:
+        return {
+            "decision": "human",
+            "ai_percentage": 0.0,
+            "confidence": "low",
+            "paragraph_count": 0,
+            "paragraphs": [],
+            "raw_overall_prob": 0.0,
+            "perplexity": None,
+            "message": "No sufficient text to analyze.",
+        }
+
+    para_results: List[Dict[str, Any]] = []
+    probs: List[float] = []
+    lengths: List[int] = []
+
+    for i, para in enumerate(paragraphs):
+        try:
+            feats = build_features_fn(para)
+            prob_ai = float(classifier.predict_proba(feats)[0, 1])
+        except Exception:
+            prob_ai = 0.0
+        probs.append(prob_ai)
+        lengths.append(len(para))
+        decision = "ai" if prob_ai >= decision_threshold else "human"
+        preview = (para[:preview_len] + "…") if len(para) > preview_len else para
+        para_results.append({
+            "index": i + 1,
+            "text_preview": preview.strip(),
+            "ai_probability": round(prob_ai, 4),
+            "decision": decision,
+        })
+
+    if weight_by_length and sum(lengths) > 0:
+        classifier_overall = sum(p * L for p, L in zip(probs, lengths)) / sum(lengths)
+    else:
+        classifier_overall = sum(probs) / len(probs) if probs else 0.0
+
+    # Perplexity: compute for full text if not provided, then blend into decision
+    if perplexity_value is not None:
+        ppl = perplexity_value
+    elif use_perplexity and text.strip():
+        try:
+            ppl = calculate_perplexity(text.strip(), model_type="scibert", aggregate="mean")
+        except Exception:
+            ppl = None
+    else:
+        ppl = None
+
+    if use_perplexity and ppl is not None and ppl > 0:
+        ppl_signal = _perplexity_to_ai_signal(ppl, ref_perplexity)
+        raw_overall = (1.0 - perplexity_weight) * classifier_overall + perplexity_weight * ppl_signal
+        raw_overall = max(0.0, min(1.0, raw_overall))
+    else:
+        raw_overall = classifier_overall
+
+    ai_percentage = round(100.0 * raw_overall, 2)
+    decision = "ai" if raw_overall >= decision_threshold else "human"
+
+    # Confidence: distance from 0.5
+    dist = abs(raw_overall - 0.5)
+    if dist >= 0.35:
+        confidence = "high"
+    elif dist >= 0.15:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    result: Dict[str, Any] = {
+        "decision": decision,
+        "ai_percentage": ai_percentage,
+        "confidence": confidence,
+        "paragraph_count": len(paragraphs),
+        "paragraphs": para_results,
+        "raw_overall_prob": round(raw_overall, 4),
+        "perplexity": round(ppl, 6) if ppl is not None else None,
+        "message": (
+            f"The text is classified as **{decision.upper()}** with an estimated "
+            f"**{ai_percentage}%** likelihood of being AI-generated (confidence: {confidence})."
+        ),
+    }
+    return result
