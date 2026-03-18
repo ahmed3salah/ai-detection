@@ -171,6 +171,26 @@ def extract_features_with_perplexity(text, model_type="scibert", aggregate="mean
         return base + [0.0, 0.0]
 
 
+def extract_features_with_dual_perplexity(text, aggregate="mean"):
+    """
+    Extract feature vector with perplexity from both GPT-2 and SciBERT (uses 2 GPUs when available).
+    Returns base + [ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert].
+    """
+    base = extract_features(text)
+    try:
+        from detector import get_perplexity_for_features_dual
+        ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert = get_perplexity_for_features_dual(
+            text, aggregate=aggregate
+        )
+        ppl_gpt2 = min(ppl_gpt2, 1e6) if ppl_gpt2 != float("inf") else 1e6
+        log_ppl_gpt2 = min(log_ppl_gpt2, 20.0) if log_ppl_gpt2 != float("inf") else 20.0
+        ppl_scibert = min(ppl_scibert, 1e6) if ppl_scibert != float("inf") else 1e6
+        log_ppl_scibert = min(log_ppl_scibert, 20.0) if log_ppl_scibert != float("inf") else 20.0
+        return base + [ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert]
+    except Exception:
+        return base + [0.0, 0.0, 0.0, 0.0]
+
+
 # For config and debugging: ordered feature names (base only; + perplexity, log_perplexity when used)
 extract_features.feature_names = [
     "avg_sentence_length",
@@ -194,3 +214,6 @@ extract_features.feature_names = [
     "formulaic_opening",
 ]
 FEATURE_NAMES_WITH_PPL = extract_features.feature_names + ["perplexity", "log_perplexity"]
+FEATURE_NAMES_DUAL_PPL = extract_features.feature_names + [
+    "perplexity_gpt2", "log_perplexity_gpt2", "perplexity_scibert", "log_perplexity_scibert"
+]

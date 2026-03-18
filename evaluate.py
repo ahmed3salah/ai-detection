@@ -8,7 +8,11 @@ import numpy as np
 import joblib
 from sklearn.metrics import accuracy_score, f1_score
 
-from features import extract_features, extract_features_with_perplexity
+from features import (
+    extract_features,
+    extract_features_with_perplexity,
+    extract_features_with_dual_perplexity,
+)
 from data_loader import load_idmgsp, load_idmgsp_test, load_local_dataset
 
 
@@ -28,9 +32,15 @@ def _get_vectorizer():
 
 def build_features(texts, config):
     """Same feature pipeline as app/training."""
+    use_dual_ppl = config.get("use_dual_perplexity", False)
     use_ppl = config.get("use_perplexity_features", True)
     use_tfidf = config.get("use_tfidf", False)
-    extract_fn = extract_features_with_perplexity if use_ppl else extract_features
+    if use_dual_ppl:
+        extract_fn = extract_features_with_dual_perplexity
+    elif use_ppl:
+        extract_fn = extract_features_with_perplexity
+    else:
+        extract_fn = extract_features
 
     dense = np.array([extract_fn(t) for t in texts], dtype=np.float64)
     if use_tfidf:

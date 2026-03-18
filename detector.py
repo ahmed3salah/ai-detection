@@ -9,7 +9,10 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 # Device: use CUDA if available (e.g. RTX A6000); no code change needed when moving to a GPU machine
+# With 2+ GPUs, GPT-2 uses cuda:0 and SciBERT uses cuda:1 so both are utilized
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_DEVICE_GPT2 = torch.device("cuda:0") if (torch.cuda.is_available() and torch.cuda.device_count() >= 2) else DEVICE
+_DEVICE_SCIBERT = torch.device("cuda:1") if (torch.cuda.is_available() and torch.cuda.device_count() >= 2) else DEVICE
 
 # Default: GPT-2 for backward compatibility and speed
 _GPT2_MODEL = None
@@ -27,7 +30,7 @@ def _get_gpt2():
     if _GPT2_MODEL is None:
         from transformers import GPT2LMHeadModel, GPT2TokenizerFast
         _GPT2_TOKENIZER = GPT2TokenizerFast.from_pretrained("gpt2")
-        _GPT2_MODEL = GPT2LMHeadModel.from_pretrained("gpt2").to(DEVICE)
+        _GPT2_MODEL = GPT2LMHeadModel.from_pretrained("gpt2").to(_DEVICE_GPT2)
         _GPT2_MODEL.eval()
     return _GPT2_MODEL, _GPT2_TOKENIZER
 
@@ -37,7 +40,7 @@ def _get_scibert():
     if _SCIBERT_MODEL is None:
         from transformers import AutoModelForMaskedLM, AutoTokenizer
         _SCIBERT_TOKENIZER = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
-        _SCIBERT_MODEL = AutoModelForMaskedLM.from_pretrained("allenai/scibert_scivocab_uncased").to(DEVICE)
+        _SCIBERT_MODEL = AutoModelForMaskedLM.from_pretrained("allenai/scibert_scivocab_uncased").to(_DEVICE_SCIBERT)
         _SCIBERT_MODEL.eval()
     return _SCIBERT_MODEL, _SCIBERT_TOKENIZER
 
@@ -84,6 +87,7 @@ def calculate_perplexity(text, model_type="gpt2", aggregate="mean"):
 
 def _perplexity_gpt2(text, aggregate):
     model, tokenizer = _get_gpt2()
+    device = next(model.parameters()).device
     chunks = _chunk_text(tokenizer, text, GPT2_MAX_LENGTH)
     perps = []
     with torch.no_grad():
@@ -91,7 +95,7 @@ def _perplexity_gpt2(text, aggregate):
             enc = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=GPT2_MAX_LENGTH)
             if enc["input_ids"].numel() == 0:
                 continue
-            enc = {k: v.to(DEVICE) for k, v in enc.items()}
+            enc = {k: v.to(device) for k, v in enc.items()}
             outputs = model(**enc, labels=enc["input_ids"])
             loss = outputs.loss
             perps.append(torch.exp(loss).item())
@@ -105,6 +109,7 @@ def _perplexity_gpt2(text, aggregate):
 def _perplexity_scibert(text, aggregate):
     """Pseudo-perplexity from MLM: forward with labels=input_ids, perplexity = exp(loss)."""
     model, tokenizer = _get_scibert()
+    device = next(model.parameters()).device
     chunks = _chunk_text(tokenizer, text, MAX_LENGTH)
     perps = []
     with torch.no_grad():
@@ -117,21 +122,21 @@ def _perplexity_scibert(text, aggregate):
                 padding="max_length",
                 return_special_tokens_mask=True,
             )
-            input_ids = enc["input_ids"].to(DEVICE)
+            input_ids = enc["input_ids"].to(device)
             attention_mask = enc.get("attention_mask")
             if attention_mask is not None:
-                attention_mask = attention_mask.to(DEVICE)
+                attention_mask = attention_mask.to(device)
             # Mask padding and special tokens so we don't count them in loss
             labels = input_ids.clone()
             if "attention_mask" in enc:
                 labels[enc["attention_mask"] == 0] = -100
             if enc.get("special_tokens_mask") is not None:
                 labels[enc["special_tokens_mask"].bool()] = -100
-            labels = labels.to(DEVICE)
+            labels = labels.to(device)
             # Only pass model-accepted kwargs (no special_tokens_mask)
             model_kw = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
             if "token_type_ids" in enc:
-                model_kw["token_type_ids"] = enc["token_type_ids"].to(DEVICE)
+                model_kw["token_type_ids"] = enc["token_type_ids"].to(device)
             outputs = model(**model_kw)
             loss = outputs.loss
             perps.append(torch.exp(loss).item())
@@ -150,6 +155,20 @@ def get_perplexity_for_features(text, model_type="scibert", aggregate="mean"):
     ppl = calculate_perplexity(text, model_type=model_type, aggregate=aggregate)
     log_ppl = float("inf") if ppl <= 0 else __import__("math").log(ppl)
     return ppl, log_ppl
+
+
+def get_perplexity_for_features_dual(text, aggregate="mean"):
+    """
+    Return perplexity and log(perplexity) from both GPT-2 and SciBERT for dual-GPU features.
+    GPT-2 runs on cuda:0, SciBERT on cuda:1 when 2+ GPUs are available.
+    Returns (ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert) with clipping applied by caller.
+    """
+    import math
+    ppl_gpt2 = calculate_perplexity(text, model_type="gpt2", aggregate=aggregate)
+    ppl_scibert = calculate_perplexity(text, model_type="scibert", aggregate=aggregate)
+    log_ppl_gpt2 = float("inf") if ppl_gpt2 <= 0 else math.log(ppl_gpt2)
+    log_ppl_scibert = float("inf") if ppl_scibert <= 0 else math.log(ppl_scibert)
+    return ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert
 
 
 # --- Production: paragraph-level detection + whole-text decision ---

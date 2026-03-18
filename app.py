@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile
 import joblib
 import numpy as np
 
-from features import extract_features, extract_features_with_perplexity
+from features import extract_features, extract_features_with_perplexity, extract_features_with_dual_perplexity
 
 app = FastAPI()
 
@@ -69,10 +69,13 @@ def _prepare_text(text: str, detection_type: str) -> str:
 
 def _build_features(text: str, config: dict):
     """Build feature vector as in training: dense (+ optional perplexity) + optional tf-idf."""
+    use_dual_ppl = config.get("use_dual_perplexity", False)
     use_ppl = config.get("use_perplexity_features", True)
     use_tfidf = config.get("use_tfidf", False)
 
-    if use_ppl:
+    if use_dual_ppl:
+        dense = np.array([extract_features_with_dual_perplexity(text)], dtype=np.float64)
+    elif use_ppl:
         dense = np.array([extract_features_with_perplexity(text)], dtype=np.float64)
     else:
         dense = np.array([extract_features(text)], dtype=np.float64)

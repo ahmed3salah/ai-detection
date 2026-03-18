@@ -14,7 +14,13 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 import joblib
 
-from features import extract_features, extract_features_with_perplexity, FEATURE_NAMES_WITH_PPL
+from features import (
+    extract_features,
+    extract_features_with_perplexity,
+    extract_features_with_dual_perplexity,
+    FEATURE_NAMES_WITH_PPL,
+    FEATURE_NAMES_DUAL_PPL,
+)
 from data_loader import load_idmgsp, load_local_dataset
 
 
@@ -26,6 +32,7 @@ def train(
     val_fraction: float = 0.2,
     random_state: int = 42,
     use_perplexity_features: bool = True,
+    use_dual_perplexity: bool = False,
     use_tfidf: bool = False,
     max_tfidf_features: int = 5000,
     arxiv_metadata_max_samples: int = 100_000,
@@ -68,8 +75,18 @@ def train(
             "No training data in %s. Add human_text.txt + ai_text.txt (or data.jsonl). See DATASET.md." % dataset_dir
         )
 
-    extract_fn = extract_features_with_perplexity if use_perplexity_features else extract_features
-    feature_names = FEATURE_NAMES_WITH_PPL if use_perplexity_features else getattr(extract_features, "feature_names")
+    if use_dual_perplexity and not use_perplexity_features:
+        raise ValueError("use_dual_perplexity requires use_perplexity_features=True")
+
+    if use_dual_perplexity:
+        extract_fn = extract_features_with_dual_perplexity
+        feature_names = FEATURE_NAMES_DUAL_PPL
+    elif use_perplexity_features:
+        extract_fn = extract_features_with_perplexity
+        feature_names = FEATURE_NAMES_WITH_PPL
+    else:
+        extract_fn = extract_features
+        feature_names = getattr(extract_features, "feature_names")
 
     # Dense features
     X_train_dense = np.array([extract_fn(t) for t in X_train], dtype=np.float64)
@@ -108,6 +125,7 @@ def train(
     config = {
         "feature_names": list(feature_names),
         "use_perplexity_features": use_perplexity_features,
+        "use_dual_perplexity": use_dual_perplexity,
         "use_tfidf": use_tfidf,
         "max_tfidf_features": max_tfidf_features if use_tfidf else None,
         "val_fraction": val_fraction,
@@ -138,6 +156,8 @@ if __name__ == "__main__":
                    help="Use abstract only or abstract+intro+conclusion")
     p.add_argument("--val-fraction", type=float, default=0.2, help="Validation fraction (0=no split)")
     p.add_argument("--no-perplexity", action="store_true", help="Disable perplexity as a feature (faster training)")
+    p.add_argument("--dual-perplexity", action="store_true",
+                    help="Use both GPT-2 and SciBERT perplexity (2 GPUs when available)")
     p.add_argument("--tfidf", action="store_true", help="Add tf-idf (1-2 gram) features")
     p.add_argument("--max-tfidf", type=int, default=5000, help="Max tf-idf features (default 5000)")
     p.add_argument("--arxiv-max-samples", type=int, default=100_000,
@@ -152,6 +172,7 @@ if __name__ == "__main__":
         val_fraction=args.val_fraction,
         random_state=args.seed,
         use_perplexity_features=not args.no_perplexity,
+        use_dual_perplexity=args.dual_perplexity,
         use_tfidf=args.tfidf,
         max_tfidf_features=args.max_tfidf,
         arxiv_metadata_max_samples=args.arxiv_max_samples,
