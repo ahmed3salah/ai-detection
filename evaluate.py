@@ -14,6 +14,7 @@ from features import (
     extract_features_with_dual_perplexity,
 )
 from data_loader import load_idmgsp, load_idmgsp_test, load_local_dataset
+from classifier_mlp import load_classifier
 
 
 def _get_config():
@@ -63,12 +64,11 @@ def evaluate(
     Load model and evaluate. If dataset_dir is set, use local data (val split).
     Otherwise use IDMGSP: native test split if available, else val split from load_idmgsp.
     """
-    model_path = Path("model.pkl")
-    if not model_path.exists():
-        raise FileNotFoundError("No model.pkl. Run training first.")
-
-    model = joblib.load(model_path)
     config = _get_config()
+    try:
+        model = load_classifier(config_path="model_config.pkl", model_dir=".")
+    except FileNotFoundError:
+        raise FileNotFoundError("No model.pt or model.pkl. Run training first.")
 
     X_test, y_test = [], []
 

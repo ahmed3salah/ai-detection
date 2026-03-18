@@ -10,9 +10,9 @@ warnings.filterwarnings("ignore", message="trust_remote_code", category=UserWarn
 from pathlib import Path
 
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 import joblib
+import torch
 
 from features import (
     extract_features,
@@ -22,6 +22,7 @@ from features import (
     FEATURE_NAMES_DUAL_PPL,
 )
 from data_loader import load_idmgsp, load_local_dataset
+from classifier_mlp import get_device, MLPClassifier, save_mlp
 
 
 def train(
@@ -113,14 +114,46 @@ def train(
         X_train_feat = X_train_dense
         X_val_feat = X_val_dense if X_val else None
 
-    y_train_arr = np.array(y_train)
-    # n_jobs=-1 uses all CPU cores; classifier runs on CPU (sklearn has no CUDA support)
-    model = RandomForestClassifier(random_state=random_state, n_jobs=-1)
-    model.fit(X_train_feat, y_train_arr)
+    y_train_arr = np.array(y_train, dtype=np.float32)
+    n_features = X_train_feat.shape[1]
+    device = get_device()
+    torch.manual_seed(random_state)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(random_state)
 
-    # Save model and config
-    Path("model.pkl").parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, "model.pkl")
+    model = MLPClassifier(input_size=n_features, hidden_size=128).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = torch.nn.BCEWithLogitsLoss()
+
+    batch_size = 64
+    n_epochs = 40
+    X_t = torch.from_numpy(X_train_feat.astype(np.float32))
+    y_t = torch.from_numpy(y_train_arr.reshape(-1, 1).astype(np.float32))
+    for epoch in range(n_epochs):
+        model.train()
+        perm = torch.randperm(len(X_t), generator=torch.Generator().manual_seed(epoch + random_state))
+        for i in range(0, len(X_t), batch_size):
+            idx = perm[i : i + batch_size]
+            xb = X_t[idx].to(device)
+            yb = y_t[idx].to(device)
+            optimizer.zero_grad()
+            logits = model(xb).unsqueeze(1)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+        if X_val is not None and X_val_feat is not None and (epoch + 1) % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                X_val_t = torch.from_numpy(X_val_feat.astype(np.float32)).to(device)
+                logits = model(X_val_t)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                pred = (probs >= 0.5).astype(np.int64)
+                val_acc = (pred == np.array(y_val)).mean()
+            print(f"Epoch {epoch + 1}/{n_epochs} validation accuracy: {val_acc:.4f}")
+
+    # Save PyTorch model and config (no model.pkl)
+    Path("model.pt").parent.mkdir(parents=True, exist_ok=True)
+    save_mlp(model, "model.pt")
 
     config = {
         "feature_names": list(feature_names),
@@ -133,17 +166,25 @@ def train(
         "idmgsp": use_idmgsp,
         "idmgsp_subset": idmgsp_subset if use_idmgsp else None,
         "idmgsp_text_mode": idmgsp_text_mode if use_idmgsp else None,
+        "classifier_type": "pytorch",
     }
     joblib.dump(config, "model_config.pkl")
 
     if vectorizer is not None:
         joblib.dump(vectorizer, "tfidf_vectorizer.pkl")
 
-    if X_val and X_val_feat is not None:
-        val_acc = model.score(X_val_feat, y_val)
+    if X_val is not None and X_val_feat is not None:
+        model.eval()
+        with torch.no_grad():
+            X_val_t = torch.from_numpy(X_val_feat.astype(np.float32)).to(device)
+            logits = model(X_val_t)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            pred = (probs >= 0.5).astype(np.int64)
+            val_acc = (pred == np.array(y_val)).mean()
         print(f"Validation accuracy: {val_acc:.4f}")
 
-    return model
+    from classifier_mlp import PyTorchClassifierWrapper
+    return PyTorchClassifierWrapper(model, device)
 
 
 if __name__ == "__main__":

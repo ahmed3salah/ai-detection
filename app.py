@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 
 from features import extract_features, extract_features_with_perplexity, extract_features_with_dual_perplexity
+from classifier_mlp import load_classifier
 
 app = FastAPI()
 
@@ -26,12 +27,13 @@ _vectorizer = None
 def _get_classifier():
     global _classifier
     if _classifier is None:
-        if not Path("model.pkl").exists():
+        try:
+            _classifier = load_classifier(config_path="model_config.pkl", model_dir=".")
+        except FileNotFoundError as e:
             raise HTTPException(
                 status_code=503,
-                detail="Model not trained yet. Run training first to create model.pkl.",
-            )
-        _classifier = joblib.load("model.pkl")
+                detail="Model not trained yet. Run training first to create model.pt or model.pkl.",
+            ) from e
     return _classifier
 
 
