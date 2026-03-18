@@ -22,7 +22,7 @@ from features import (
     FEATURE_NAMES_DUAL_PPL,
 )
 from data_loader import load_idmgsp, load_local_dataset
-from classifier_mlp import get_device, MLPClassifier, save_mlp
+from classifier_mlp import get_device, MLPClassifier, save_mlp, print_device_status
 
 
 def train(
@@ -42,6 +42,7 @@ def train(
     Load data (local dataset/ by default, or IDMGSP with --idmgsp), extract features,
     train classifier, save model and config.
     """
+    print(f"[Training] PyTorch {torch.__version__}  CUDA available: {torch.cuda.is_available()}")
     X_train, y_train, X_val, y_val = [], [], [], []
     if use_idmgsp:
         try:
@@ -89,6 +90,12 @@ def train(
         extract_fn = extract_features
         feature_names = getattr(extract_features, "feature_names")
 
+    # Device status for feature extraction (perplexity runs in detector)
+    from detector import print_detector_device_status
+    print_detector_device_status()
+    print(f"[Training] Data: train={len(X_train)}, val={len(X_val) or 0}")
+    print(f"[Training] Feature extraction: use_perplexity={use_perplexity_features}, use_dual_perplexity={use_dual_perplexity}")
+
     # Dense features
     X_train_dense = np.array([extract_fn(t) for t in X_train], dtype=np.float64)
     if X_val:
@@ -116,7 +123,12 @@ def train(
 
     y_train_arr = np.array(y_train, dtype=np.float32)
     n_features = X_train_feat.shape[1]
+    print(f"[Training] Feature matrix: {X_train_feat.shape[0]} samples, {n_features} features")
+
     device = get_device()
+    print_device_status("Classifier")
+    print(f"[Training] Classifier training: device={device}, batch_size=64, n_epochs=40")
+
     torch.manual_seed(random_state)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(random_state)
@@ -131,6 +143,8 @@ def train(
     y_t = torch.from_numpy(y_train_arr.reshape(-1, 1).astype(np.float32))
     for epoch in range(n_epochs):
         model.train()
+        epoch_loss = 0.0
+        n_batches = 0
         perm = torch.randperm(len(X_t), generator=torch.Generator().manual_seed(epoch + random_state))
         for i in range(0, len(X_t), batch_size):
             idx = perm[i : i + batch_size]
@@ -141,6 +155,11 @@ def train(
             loss = criterion(logits, yb)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+        avg_loss = epoch_loss / n_batches if n_batches else 0.0
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"[Training] Epoch {epoch + 1}/{n_epochs}  loss={avg_loss:.4f}  device={device}")
         if X_val is not None and X_val_feat is not None and (epoch + 1) % 10 == 0:
             model.eval()
             with torch.no_grad():
@@ -154,6 +173,7 @@ def train(
     # Save PyTorch model and config (no model.pkl)
     Path("model.pt").parent.mkdir(parents=True, exist_ok=True)
     save_mlp(model, "model.pt")
+    print(f"[Training] Saved model.pt (device used: {device})")
 
     config = {
         "feature_names": list(feature_names),

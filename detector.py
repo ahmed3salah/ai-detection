@@ -25,6 +25,19 @@ MAX_LENGTH = 512
 GPT2_MAX_LENGTH = 1024
 
 
+def print_detector_device_status() -> None:
+    """Print device setup for perplexity models (GPT-2, SciBERT). Call before feature extraction."""
+    cuda_ok = torch.cuda.is_available()
+    n = torch.cuda.device_count() if cuda_ok else 0
+    print("[Detector] Perplexity (GPT-2 / SciBERT) device setup:")
+    print(f"[Detector]   CUDA available: {cuda_ok}, device count: {n}")
+    if n >= 2:
+        print(f"[Detector]   GPT-2  -> cuda:0 ({torch.cuda.get_device_name(0)})")
+        print(f"[Detector]   SciBERT -> cuda:1 ({torch.cuda.get_device_name(1)})")
+    else:
+        print(f"[Detector]   Both models -> {DEVICE}")
+
+
 def _get_gpt2():
     global _GPT2_MODEL, _GPT2_TOKENIZER
     if _GPT2_MODEL is None:

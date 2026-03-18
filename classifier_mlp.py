@@ -24,6 +24,22 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def print_device_status(prefix: str = "Classifier") -> None:
+    """Print PyTorch device availability and selected device for training/inference."""
+    cuda_ok = torch.cuda.is_available()
+    cuda_count = torch.cuda.device_count() if cuda_ok else 0
+    mps = getattr(torch.backends, "mps", None)
+    mps_ok = mps is not None and mps.is_available()
+    device = get_device()
+    print(f"[{prefix}] PyTorch CUDA available: {cuda_ok}")
+    if cuda_ok:
+        print(f"[{prefix}] CUDA device count: {cuda_count}")
+        for i in range(cuda_count):
+            print(f"[{prefix}]   cuda:{i} -> {torch.cuda.get_device_name(i)}")
+    print(f"[{prefix}] PyTorch MPS (Apple Silicon) available: {mps_ok}")
+    print(f"[{prefix}] Selected device: {device}")
+
+
 # -----------------------------------------------------------------------------
 # MLP model
 # -----------------------------------------------------------------------------
