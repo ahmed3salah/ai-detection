@@ -14,10 +14,23 @@ import torch.nn as nn
 # -----------------------------------------------------------------------------
 
 
+def _cuda_kernels_work() -> bool:
+    """Try a minimal CUDA op. Returns False if GPU is not supported (e.g. Blackwell sm_120 on older PyTorch)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        torch.zeros(2, device="cuda").sum().item()
+        return True
+    except RuntimeError:
+        return False
+
+
 def get_device() -> torch.device:
-    """Return best available device: cuda, then mps (Apple Silicon), then cpu."""
-    if torch.cuda.is_available():
+    """Return best available device: cuda (if kernels work), then mps (Apple Silicon), then cpu."""
+    if torch.cuda.is_available() and _cuda_kernels_work():
         return torch.device("cuda")
+    if torch.cuda.is_available() and not _cuda_kernels_work():
+        print("[Device] CUDA is available but kernels failed (e.g. Blackwell sm_120 on PyTorch < 2.7). Using CPU.")
     mps = getattr(torch.backends, "mps", None)
     if mps is not None and mps.is_available():
         return torch.device("mps")
@@ -27,11 +40,12 @@ def get_device() -> torch.device:
 def print_device_status(prefix: str = "Classifier") -> None:
     """Print PyTorch device availability and selected device for training/inference."""
     cuda_ok = torch.cuda.is_available()
+    cuda_works = _cuda_kernels_work() if cuda_ok else False
     cuda_count = torch.cuda.device_count() if cuda_ok else 0
     mps = getattr(torch.backends, "mps", None)
     mps_ok = mps is not None and mps.is_available()
     device = get_device()
-    print(f"[{prefix}] PyTorch CUDA available: {cuda_ok}")
+    print(f"[{prefix}] PyTorch CUDA available: {cuda_ok}  (kernels work: {cuda_works})")
     if cuda_ok:
         print(f"[{prefix}] CUDA device count: {cuda_count}")
         for i in range(cuda_count):

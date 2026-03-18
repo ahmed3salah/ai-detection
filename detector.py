@@ -8,11 +8,23 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-# Device: use CUDA if available (e.g. RTX A6000); no code change needed when moving to a GPU machine
-# With 2+ GPUs, GPT-2 uses cuda:0 and SciBERT uses cuda:1 so both are utilized
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_DEVICE_GPT2 = torch.device("cuda:0") if (torch.cuda.is_available() and torch.cuda.device_count() >= 2) else DEVICE
-_DEVICE_SCIBERT = torch.device("cuda:1") if (torch.cuda.is_available() and torch.cuda.device_count() >= 2) else DEVICE
+# Device: use CUDA only if kernels work (e.g. Blackwell sm_120 fails on PyTorch < 2.7)
+def _detector_cuda_works():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        torch.zeros(2, device="cuda").sum().item()
+        return True
+    except RuntimeError:
+        return False
+
+
+_USE_CUDA = torch.cuda.is_available() and _detector_cuda_works()
+if torch.cuda.is_available() and not _USE_CUDA:
+    print("[Detector] CUDA kernels not supported on this GPU (e.g. Blackwell). Using CPU for perplexity.")
+DEVICE = torch.device("cuda" if _USE_CUDA else "cpu")
+_DEVICE_GPT2 = torch.device("cuda:0") if (_USE_CUDA and torch.cuda.device_count() >= 2) else DEVICE
+_DEVICE_SCIBERT = torch.device("cuda:1") if (_USE_CUDA and torch.cuda.device_count() >= 2) else DEVICE
 
 # Default: GPT-2 for backward compatibility and speed
 _GPT2_MODEL = None
