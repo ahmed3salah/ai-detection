@@ -97,7 +97,8 @@ def train(
         X_val_feat = X_val_dense if X_val else None
 
     y_train_arr = np.array(y_train)
-    model = RandomForestClassifier(random_state=random_state)
+    # n_jobs=-1 uses all CPU cores; classifier runs on CPU (sklearn has no CUDA support)
+    model = RandomForestClassifier(random_state=random_state, n_jobs=-1)
     model.fit(X_train_feat, y_train_arr)
 
     # Save model and config

@@ -8,6 +8,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
+# Device: use CUDA if available (e.g. RTX A6000); no code change needed when moving to a GPU machine
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # Default: GPT-2 for backward compatibility and speed
 _GPT2_MODEL = None
 _GPT2_TOKENIZER = None
@@ -24,7 +27,7 @@ def _get_gpt2():
     if _GPT2_MODEL is None:
         from transformers import GPT2LMHeadModel, GPT2TokenizerFast
         _GPT2_TOKENIZER = GPT2TokenizerFast.from_pretrained("gpt2")
-        _GPT2_MODEL = GPT2LMHeadModel.from_pretrained("gpt2")
+        _GPT2_MODEL = GPT2LMHeadModel.from_pretrained("gpt2").to(DEVICE)
         _GPT2_MODEL.eval()
     return _GPT2_MODEL, _GPT2_TOKENIZER
 
@@ -34,7 +37,7 @@ def _get_scibert():
     if _SCIBERT_MODEL is None:
         from transformers import AutoModelForMaskedLM, AutoTokenizer
         _SCIBERT_TOKENIZER = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
-        _SCIBERT_MODEL = AutoModelForMaskedLM.from_pretrained("allenai/scibert_scivocab_uncased")
+        _SCIBERT_MODEL = AutoModelForMaskedLM.from_pretrained("allenai/scibert_scivocab_uncased").to(DEVICE)
         _SCIBERT_MODEL.eval()
     return _SCIBERT_MODEL, _SCIBERT_TOKENIZER
 
@@ -88,6 +91,7 @@ def _perplexity_gpt2(text, aggregate):
             enc = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=GPT2_MAX_LENGTH)
             if enc["input_ids"].numel() == 0:
                 continue
+            enc = {k: v.to(DEVICE) for k, v in enc.items()}
             outputs = model(**enc, labels=enc["input_ids"])
             loss = outputs.loss
             perps.append(torch.exp(loss).item())
@@ -113,17 +117,21 @@ def _perplexity_scibert(text, aggregate):
                 padding="max_length",
                 return_special_tokens_mask=True,
             )
-            input_ids = enc["input_ids"]
+            input_ids = enc["input_ids"].to(DEVICE)
+            attention_mask = enc.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(DEVICE)
             # Mask padding and special tokens so we don't count them in loss
             labels = input_ids.clone()
             if "attention_mask" in enc:
                 labels[enc["attention_mask"] == 0] = -100
             if enc.get("special_tokens_mask") is not None:
                 labels[enc["special_tokens_mask"].bool()] = -100
+            labels = labels.to(DEVICE)
             # Only pass model-accepted kwargs (no special_tokens_mask)
-            model_kw = {"input_ids": enc["input_ids"], "attention_mask": enc.get("attention_mask"), "labels": labels}
+            model_kw = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
             if "token_type_ids" in enc:
-                model_kw["token_type_ids"] = enc["token_type_ids"]
+                model_kw["token_type_ids"] = enc["token_type_ids"].to(DEVICE)
             outputs = model(**model_kw)
             loss = outputs.loss
             perps.append(torch.exp(loss).item())
