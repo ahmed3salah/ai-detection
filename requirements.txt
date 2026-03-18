@@ -53,7 +53,10 @@ sympy==1.14.0
 thinc==8.3.9
 threadpoolctl==3.6.0
 tokenizers==0.22.2
-torch==2.8.0
+# PyTorch: default install is CPU. For NVIDIA GPU (including Blackwell sm_120), after installing
+# run: pip uninstall torch torchvision torchaudio
+# then: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
 tqdm==4.67.3
 transformers==4.57.6
 typer==0.23.2
