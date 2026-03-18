@@ -3,8 +3,11 @@ Feature extraction for AI vs human scientific text.
 Includes generic style + scientific-domain (passive, hedging, diversity, structure).
 """
 import re
-import spacy
+import subprocess
+import sys
+
 import numpy as np
+import spacy
 
 # Hedging cues common in scientific writing (AI may over/under-use)
 HEDGING_WORDS = {
@@ -21,7 +24,12 @@ nlp = None
 def _get_nlp():
     global nlp
     if nlp is None:
-        nlp = spacy.load("en_core_web_sm")
+        try:
+            nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            # Model not installed; download it (e.g. first run or new env)
+            subprocess.check_call([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
+            nlp = spacy.load("en_core_web_sm")
     return nlp
 
 
