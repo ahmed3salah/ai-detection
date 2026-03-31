@@ -20,9 +20,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
-# Add project root
+# Add project root and scripts dir (for ai_jsonl_quality)
 _project_root = Path(__file__).resolve().parent.parent
+_scripts_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_project_root))
+if str(_scripts_dir) not in sys.path:
+    sys.path.insert(0, str(_scripts_dir))
+
+from ai_jsonl_quality import (  # noqa: E402
+    MIN_ABSTRACT_LEN,
+    is_usable_abstract,
+    validate_metadata_fields,
+)
 
 # Load .env so API keys can live in .env (which should be in .gitignore)
 def _load_dotenv(path: Path) -> None:
@@ -174,7 +183,6 @@ DEFAULT_OPENROUTER_MODELS = [
     "anthropic/claude-3-5-haiku",
     "anthropic/claude-3-5-sonnet",
     "google/gemini-2.5-flash",
-    "google/gemini-2.5-pro",
     "meta-llama/llama-3.3-70b-instruct",
     "mistralai/mistral-large",
     "deepseek/deepseek-r1",
@@ -245,62 +253,6 @@ def _norm_str(val: Any, max_len: Optional[int] = None) -> str:
     else:
         s = str(val).strip().replace("\n", " ")
     return s[:max_len] if max_len else s
-
-
-# Minimum length for an abstract to be considered usable (avoids storing "AI-Physicist: A" or "is").
-MIN_ABSTRACT_LEN = 50
-# Substrings that indicate garbage/corruption (markdown fragments, malformed keys, obvious glitches).
-_GARBAGE_SUBSTRINGS = (
-    "**Categories**",
-    "titlerc",
-    "categories\\",
-    "  *   *",
-    "Pert-urbOfUrbativeive",
-    "Order Pert-urb",
-    "OfUrbativeive",
-    "quququ",
-    "pertpert",
-)
-# Meta/colloquial responses where the model talks about generating JSON instead of outputting it (e.g. Gemini).
-_META_JSON_PHRASES = (
-    "i've assembled",
-    "json output",
-    "my title is now confirmed",
-    "necessary components",
-    "here is the json",
-    "here's the json",
-    "as requested",
-    "below is the json",
-)
-
-
-def _is_usable_abstract(text: str) -> bool:
-    """Return False if abstract is too short or looks like garbage/corruption; otherwise True."""
-    if not text or not isinstance(text, str):
-        return False
-    s = text.strip().replace("\n", " ")
-    if len(s) < MIN_ABSTRACT_LEN:
-        return False
-    s_lower = s.lower()
-    for bad in _GARBAGE_SUBSTRINGS:
-        if bad.lower() in s_lower:
-            return False
-    for phrase in _META_JSON_PHRASES:
-        if phrase in s_lower:
-            return False
-    # Reject if it's just a title fragment (e.g. "AI-Physicist: A" or "SpectraGuard: A Frequency-")
-    if s.endswith(": A") or s.endswith(": A ") or (len(s) < 80 and s.count(" ") < 4):
-        return False
-    # Reject if it looks like unparsed JSON blob (raw/truncated API response stored as abstract)
-    # Normalize escaped quotes so we catch both "title" and \"title\"
-    s_norm = s.replace('\\"', '"')
-    if s_norm.startswith("{"):
-        # Any JSON-like blob (has "title" key) or short truncated fragment
-        if '"title"' in s_norm and s_norm.count('"') >= 4:
-            return False
-        if len(s_norm) < 200 and "title" in s_norm and (":" in s_norm or '"' in s_norm):
-            return False
-    return True
 
 
 def _extract_json_fields_regex(raw: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -383,7 +335,7 @@ def _parse_json_paper_stub(raw: str) -> Tuple[Optional[str], Optional[str], str]
             return (t, c, a)
         # Truncated JSON (e.g. Gemini cut off): use partial title as title+abstract only if long enough
         partial_title = _extract_truncated_title(raw)
-        if partial_title and len(partial_title) >= MIN_ABSTRACT_LEN and _is_usable_abstract(partial_title):
+        if partial_title and len(partial_title) >= MIN_ABSTRACT_LEN and is_usable_abstract(partial_title):
             return (partial_title, None, partial_title)
     return (None, None, raw.replace("\n", " "))
 
@@ -456,6 +408,91 @@ def load_jsonl_for_pairing(path: Path, text_mode: str = "abstract") -> List[Tupl
     return pairs
 
 
+def build_generation_failed_record(
+    index: int,
+    model: str,
+    provider: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Placeholder row so line index stays aligned with task index (for merge/regeneration)."""
+    from datetime import date
+
+    return {
+        "id": "ai-%d" % index,
+        "title": "",
+        "abstract": "",
+        "categories": "",
+        "authors_parsed": [],
+        "update_date": date.today().isoformat(),
+        "ai_written": 1,
+        "model": model,
+        "provider": provider,
+        "generation_failed": 1,
+        "generation_note": (reason or "")[:500],
+    }
+
+
+def _append_failure_log(path: Optional[Path], entry: Dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as lf:
+        lf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _parse_regenerate_indices(spec: str) -> List[int]:
+    """Load indices from a file (one int per line) or comma-separated list."""
+    p = Path(spec)
+    if p.exists():
+        out: List[int] = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            out.append(int(line.split()[0]))
+        return sorted(set(out))
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return sorted(set(out))
+
+
+def _generate_valid_topic_metadata_row(
+    complete_fn: Callable,
+    topic: str,
+    model: str,
+    style: str,
+    provider: str,
+    require_categories: bool,
+) -> Tuple[Optional[Tuple[str, str, str, Optional[Dict[str, Any]], str, str]], List[str]]:
+    title, categories, abstract = generate_abstract_with_metadata(
+        complete_fn, topic, model=model, style=style
+    )
+    ok, reasons = validate_metadata_fields(
+        title or "",
+        categories or "",
+        abstract or "",
+        require_categories=require_categories,
+    )
+    if ok:
+        source_record = {
+            "title": (title or "").strip(),
+            "categories": (categories or "").strip(),
+        }
+        row: Tuple[str, str, str, Optional[Dict[str, Any]], str, str] = (
+            abstract,
+            "topic",
+            topic[:50],
+            source_record,
+            model,
+            provider,
+        )
+        return (row, [])
+    return (None, reasons)
+
+
 def build_arxiv_style_record(
     ai_abstract: str,
     source: Optional[Dict[str, Any]],
@@ -493,18 +530,128 @@ def _run_one_topic(
     style: str,
     provider: str,
     want_metadata: bool = False,
+    require_categories: bool = True,
 ) -> Optional[Tuple[str, str, str, Optional[Dict[str, Any]], str, str]]:
     """Generate one abstract for a topic. If want_metadata, also get title and categories (arxiv-style). Returns (text, source, meta, source_record, model_used, provider_used) or None."""
     if want_metadata:
-        title, categories, abstract = generate_abstract_with_metadata(complete_fn, topic, model=model, style=style)
-        if not abstract or not _is_usable_abstract(abstract):
-            return None
-        source_record: Optional[Dict[str, Any]] = None
-        if title is not None or categories is not None:
-            source_record = {"title": title or "", "categories": categories or ""}
-        return (abstract, "topic", topic[:50], source_record, model, provider)
+        row, _reasons = _generate_valid_topic_metadata_row(
+            complete_fn, topic, model, style, provider, require_categories
+        )
+        return row
     text = generate_abstract(complete_fn, topic, model=model, style=style)
-    return (text, "topic", topic[:50], None, model, provider) if text else None
+    text_one = (text or "").replace("\n", " ")
+    if text_one and is_usable_abstract(text_one):
+        return (text_one, "topic", topic[:50], None, model, provider)
+    return None
+
+
+def _run_topic_task_with_retries(
+    complete_fn: Callable,
+    topic: str,
+    model_t: str,
+    style_t: str,
+    provider_t: str,
+    want_metadata: bool,
+    require_categories: bool,
+    max_retries: int,
+    failure_log: Optional[Path],
+    task_index: int,
+) -> Tuple[Optional[Tuple[str, str, str, Optional[Dict[str, Any]], str, str]], List[str]]:
+    last_reasons: List[str] = []
+    for _attempt in range(max(1, max_retries)):
+        if want_metadata:
+            row, reasons = _generate_valid_topic_metadata_row(
+                complete_fn, topic, model_t, style_t, provider_t, require_categories
+            )
+            if row:
+                return (row, [])
+            last_reasons = reasons
+        else:
+            text = generate_abstract(complete_fn, topic, model=model_t, style=style_t)
+            text_one = (text or "").replace("\n", " ")
+            if text_one and is_usable_abstract(text_one):
+                return (
+                    (
+                        text_one,
+                        "topic",
+                        topic[:50],
+                        None,
+                        model_t,
+                        provider_t,
+                    ),
+                    [],
+                )
+            last_reasons = ["abstract_invalid_or_short"]
+    _append_failure_log(
+        failure_log,
+        {
+            "task_index": task_index,
+            "topic": topic[:200],
+            "model": model_t,
+            "reasons": last_reasons,
+            "phase": "topic",
+        },
+    )
+    return (None, last_reasons)
+
+
+def _worker_regenerate_one(payload: Tuple[Any, ...]) -> Tuple[int, Optional[Dict[str, Any]], List[str]]:
+    (
+        idx,
+        complete_fn,
+        topics,
+        model_t,
+        style_t,
+        provider_t,
+        require_categories,
+        max_retries,
+        failure_log,
+    ) = payload
+    topic = topics[idx % len(topics)]
+    row, reasons = _run_topic_task_with_retries(
+        complete_fn,
+        topic,
+        model_t,
+        style_t,
+        provider_t,
+        True,
+        require_categories,
+        max_retries,
+        failure_log,
+        idx,
+    )
+    if row:
+        rec = build_arxiv_style_record(row[0], row[3], idx, row[4], row[5])
+        return (idx, rec, [])
+    return (idx, None, reasons)
+
+
+def _worker_topic_indexed(payload: Tuple[Any, ...]) -> Tuple[int, Optional[Tuple], List[str], str, str]:
+    (
+        task_index,
+        complete_fn,
+        topic,
+        model_t,
+        style_t,
+        provider_t,
+        want_metadata,
+        require_categories,
+        max_retries,
+        failure_log,
+    ) = payload
+    row, reasons = _run_topic_task_with_retries(
+        complete_fn,
+        topic,
+        model_t,
+        style_t,
+        provider_t,
+        want_metadata,
+        require_categories,
+        max_retries,
+        failure_log,
+        task_index,
+    )
+    return (task_index, row, reasons, model_t, provider_t)
 
 
 def _run_one_paired(
@@ -518,9 +665,10 @@ def _run_one_paired(
 ) -> Optional[Tuple[str, str, str, Optional[Dict[str, Any]], str, str]]:
     """Generate one paired abstract. Returns (text, source, meta, source_record, model_used, provider_used) or None."""
     text = generate_paired_abstract(complete_fn, human, model=model, style=style)
-    if not text:
+    text_one = (text or "").replace("\n", " ")
+    if not text_one or not is_usable_abstract(text_one):
         return None
-    return (text, "paired", str(index), source_record, model, provider)
+    return (text_one, "paired", str(index), source_record, model, provider)
 
 
 def _write_one_result(
@@ -681,6 +829,20 @@ Providers and env vars:
     p.add_argument("--models", default=None,
                    help="Comma-separated OpenRouter model IDs for --multi-model (e.g. openai/gpt-4o-mini,anthropic/claude-3-5-haiku). "
                         "Default: 9 popular models (OpenAI, Anthropic, Google, Meta, Mistral, DeepSeek).")
+    p.add_argument("--max-retries", type=int, default=3,
+                   help="Retries per sample when validation fails (topic JSONL and --regenerate-indices). Default: 3")
+    p.add_argument("--failure-log", type=Path, default=None,
+                   help="Append JSON lines describing failed validations (default: <output>.failures.jsonl for topic JSONL).")
+    p.add_argument("--no-require-categories", action="store_true",
+                   help="Allow empty categories when validating metadata JSONL rows.")
+    p.add_argument("--skip-failure-rows", action="store_true",
+                   help="Do not write generation_failed placeholder rows; line count may be below --target.")
+    p.add_argument(
+        "--regenerate-indices",
+        default=None,
+        metavar="FILE_OR_COMMA_LIST",
+        help="Only regenerate listed indices (file: one int per line, or comma-separated). Requires --topic-file and .jsonl --output.",
+    )
     args = p.parse_args()
 
     # Resolve model list when multi-model: use OpenRouter and cycle through models (pair-from and topic-file)
@@ -887,79 +1049,248 @@ Providers and env vars:
         if not topics:
             print("Provide --topics or --topic-file or --pair-from")
             return 1
-        # With --target: generate that many by cycling through topics; otherwise one per topic (capped by --limit).
-        total = (args.target if args.target is not None else len(topics))
-        if args.limit is not None:
-            total = min(total, args.limit)
-        # Build tasks: cycle topics (and models) so we get exactly `total` items. When JSONL output, request title+categories too.
-        want_metadata = is_jsonl
-        if models_list:
-            print("Using provider=openrouter with %d models. Generating %d abstract(s) from %d topics (cycling)%s (workers=%d)..." % (
-                len(models_list), total, len(topics), " (limit %d)" % args.limit if args.limit else "", workers))
-            tasks = [(complete_fn, topics[i % len(topics)], models_list[i % len(models_list)], args.style, "openrouter", want_metadata) for i in range(total)]
-        else:
-            print("Using provider=%s model=%s. Generating %d abstract(s) from %d topics (cycling)%s (workers=%d)..." % (
-                args.provider, model, total, len(topics), " (limit %d)" % args.limit if args.limit else "", workers))
-            tasks = [(complete_fn, topics[i % len(topics)], model, args.style, args.provider, want_metadata) for i in range(total)]
-        # Resume: when using --topic-file, same output and total allow resuming from written_count
-        mode = "w"
-        written_count = 0
-        if not args.append and args.topic_file:
-            state = _load_progress_state(out_path)
-            out_norm = _normalize_path(out_path)
-            topic_norm = _normalize_path(args.topic_file)
-            if state and _normalize_path(state.get("output", "")) == out_norm and _normalize_path(state.get("topic_file", "")) == topic_norm:
-                prev_written = state.get("written_count", 0)
-                prev_total = state.get("total_planned", total)
-                if prev_total == total:
-                    if prev_written >= total:
-                        if _prompt_overwrite_complete(state, total, out_path):
-                            mode = "w"
-                        else:
-                            print("Exiting.")
-                            return 0
-                    elif prev_written > 0:
-                        if _prompt_resume(state, out_path, total):
-                            mode = "a"
-                            written_count = prev_written
-                            tasks = tasks[prev_written:]
-                            print("Resuming from %d/%d..." % (written_count, total))
-                        else:
-                            mode = "w"
-        start_time = time.time()
-        with out_path.open(mode, encoding="utf-8") as f:
-            if use_parallel:
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {
-                        executor.submit(_run_one_topic, t[0], t[1], t[2], t[3], t[4], t[5]): t
-                        for t in tasks
-                    }
-                    for fut in as_completed(futures):
+        require_categories = not args.no_require_categories
+        max_retries = max(1, int(args.max_retries))
+        topic_failure_log: Optional[Path] = args.failure_log
+        if topic_failure_log is None and is_jsonl and args.topic_file:
+            topic_failure_log = out_path.with_name(out_path.stem + ".failures.jsonl")
+
+        if args.regenerate_indices:
+            if not args.topic_file:
+                print("Error: --regenerate-indices requires --topic-file")
+                return 1
+            if not is_jsonl:
+                print("Error: --regenerate-indices requires JSONL --output (e.g. .jsonl)")
+                return 1
+            try:
+                reg_indices = _parse_regenerate_indices(args.regenerate_indices)
+            except ValueError as e:
+                print("Error: invalid --regenerate-indices: %s" % e)
+                return 1
+            if not reg_indices:
+                print("Error: no indices parsed from --regenerate-indices")
+                return 1
+            reg_fail = topic_failure_log
+            print("Regenerating %d index(es) -> %s (workers=%d)..." % (len(reg_indices), out_path, workers))
+            start_time = time.time()
+            lines_out = 0
+            with out_path.open("w", encoding="utf-8") as f:
+                if use_parallel:
+                    payloads = []
+                    for idx in reg_indices:
+                        model_t = models_list[idx % len(models_list)] if models_list else model
+                        provider_t = "openrouter" if models_list else args.provider
+                        payloads.append(
+                            (
+                                idx,
+                                complete_fn,
+                                topics,
+                                model_t,
+                                args.style,
+                                provider_t,
+                                require_categories,
+                                max_retries,
+                                reg_fail,
+                            )
+                        )
+                    results: List[Tuple[int, Optional[Dict[str, Any]], List[str]]] = []
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {executor.submit(_worker_regenerate_one, p): p[0] for p in payloads}
+                        for fut in as_completed(futures):
+                            try:
+                                results.append(fut.result())
+                            except Exception as e:
+                                print("  Warning: %s" % e)
+                    for _idx, rec, _reasons in sorted(results, key=lambda x: x[0]):
+                        if rec:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            lines_out += 1
+                else:
+                    for idx in reg_indices:
+                        model_t = models_list[idx % len(models_list)] if models_list else model
+                        provider_t = "openrouter" if models_list else args.provider
+                        payload = (
+                            idx,
+                            complete_fn,
+                            topics,
+                            model_t,
+                            args.style,
+                            provider_t,
+                            require_categories,
+                            max_retries,
+                            reg_fail,
+                        )
                         try:
-                            result = fut.result()
-                            if result:
-                                _write_one_result(f, result, written_count, is_jsonl, model, args.provider)
-                                written_count += 1
-                                _print_progress(written_count, total, start_time, result[4] if len(result) > 4 else None)
-                                if args.topic_file:
-                                    _save_progress_state(out_path, written_count, total, topic_file=args.topic_file)
+                            _i, rec, _r = _worker_regenerate_one(payload)
+                            if rec:
+                                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                                lines_out += 1
                         except Exception as e:
                             print("  Warning: %s" % e)
+                        time.sleep(args.delay)
+                        _print_progress(min(lines_out + 1, len(reg_indices)), len(reg_indices), start_time, model_t)
                 print()
+            print("Wrote %d patch line(s) to %s (merge with audit_ai_jsonl.py merge)" % (lines_out, out_path))
+            written_count = lines_out
+        else:
+            # With --target: generate that many by cycling through topics; otherwise one per topic (capped by --limit).
+            total = (args.target if args.target is not None else len(topics))
+            if args.limit is not None:
+                total = min(total, args.limit)
+            want_metadata = is_jsonl
+            if models_list:
+                print("Using provider=openrouter with %d models. Generating %d abstract(s) from %d topics (cycling)%s (workers=%d)..." % (
+                    len(models_list), total, len(topics), " (limit %d)" % args.limit if args.limit else "", workers))
+                all_tasks = [
+                    (
+                        i,
+                        complete_fn,
+                        topics[i % len(topics)],
+                        models_list[i % len(models_list)],
+                        args.style,
+                        "openrouter",
+                        want_metadata,
+                    )
+                    for i in range(total)
+                ]
             else:
-                for (complete_fn_t, topic, model_t, style_t, provider_t, want_meta) in tasks:
-                    try:
-                        result = _run_one_topic(complete_fn_t, topic, model_t, style_t, provider_t, want_meta)
-                        if result:
-                            _write_one_result(f, result, written_count, is_jsonl, model, args.provider)
-                            written_count += 1
-                            _print_progress(written_count, total, start_time, result[4] if len(result) > 4 else None)
+                print("Using provider=%s model=%s. Generating %d abstract(s) from %d topics (cycling)%s (workers=%d)..." % (
+                    args.provider, model, total, len(topics), " (limit %d)" % args.limit if args.limit else "", workers))
+                all_tasks = [
+                    (i, complete_fn, topics[i % len(topics)], model, args.style, args.provider, want_metadata)
+                    for i in range(total)
+                ]
+            tasks = list(all_tasks)
+            mode = "w"
+            if not args.append and args.topic_file:
+                state = _load_progress_state(out_path)
+                out_norm = _normalize_path(out_path)
+                topic_norm = _normalize_path(args.topic_file)
+                if state and _normalize_path(state.get("output", "")) == out_norm and _normalize_path(state.get("topic_file", "")) == topic_norm:
+                    prev_written = state.get("written_count", 0)
+                    prev_total = state.get("total_planned", total)
+                    if prev_total == total:
+                        if prev_written >= total:
+                            if _prompt_overwrite_complete(state, total, out_path):
+                                mode = "w"
+                            else:
+                                print("Exiting.")
+                                return 0
+                        elif prev_written > 0:
+                            if _prompt_resume(state, out_path, total):
+                                mode = "a"
+                                tasks = all_tasks[prev_written:]
+                                print("Resuming from task %d/%d..." % (prev_written, total))
+                            else:
+                                mode = "w"
+            written_count = 0
+            start_time = time.time()
+            with out_path.open(mode, encoding="utf-8") as f:
+                if use_parallel:
+                    payloads = []
+                    for t in tasks:
+                        (
+                            task_index,
+                            complete_fn_t,
+                            topic,
+                            model_t,
+                            style_t,
+                            provider_t,
+                            want_meta,
+                        ) = t
+                        payloads.append(
+                            (
+                                task_index,
+                                complete_fn_t,
+                                topic,
+                                model_t,
+                                style_t,
+                                provider_t,
+                                want_meta,
+                                require_categories,
+                                max_retries,
+                                topic_failure_log,
+                            )
+                        )
+                    batch_results: List[Tuple[int, Optional[Tuple], List[str], str, str]] = []
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {executor.submit(_worker_topic_indexed, p): p[0] for p in payloads}
+                        for fut in as_completed(futures):
+                            try:
+                                batch_results.append(fut.result())
+                            except Exception as e:
+                                print("  Warning: %s" % e)
+                    for task_index, row, reasons, model_t, provider_t in sorted(
+                        batch_results, key=lambda x: x[0]
+                    ):
+                        try:
+                            if row:
+                                _write_one_result(f, row, task_index, is_jsonl, model, args.provider)
+                                written_count += 1
+                            elif (
+                                is_jsonl
+                                and want_metadata
+                                and not args.skip_failure_rows
+                            ):
+                                note = ",".join(reasons) if reasons else "unknown"
+                                fail_rec = build_generation_failed_record(
+                                    task_index, model_t, provider_t, note
+                                )
+                                f.write(json.dumps(fail_rec, ensure_ascii=False) + "\n")
+                                written_count += 1
+                            done = task_index + 1
+                            _print_progress(done, total, start_time, model_t)
                             if args.topic_file:
-                                _save_progress_state(out_path, written_count, total, topic_file=args.topic_file)
-                    except Exception as e:
-                        print("  Warning: %s" % e)
-                    time.sleep(args.delay)
-                print()
+                                _save_progress_state(out_path, done, total, topic_file=args.topic_file)
+                        except Exception as e:
+                            print("  Warning: %s" % e)
+                    print()
+                else:
+                    for t in tasks:
+                        (
+                            task_index,
+                            complete_fn_t,
+                            topic,
+                            model_t,
+                            style_t,
+                            provider_t,
+                            want_meta,
+                        ) = t
+                        try:
+                            row, reasons = _run_topic_task_with_retries(
+                                complete_fn_t,
+                                topic,
+                                model_t,
+                                style_t,
+                                provider_t,
+                                want_meta,
+                                require_categories,
+                                max_retries,
+                                topic_failure_log,
+                                task_index,
+                            )
+                            if row:
+                                _write_one_result(f, row, task_index, is_jsonl, model, args.provider)
+                                written_count += 1
+                            elif (
+                                is_jsonl
+                                and want_meta
+                                and not args.skip_failure_rows
+                            ):
+                                note = ",".join(reasons) if reasons else "unknown"
+                                fail_rec = build_generation_failed_record(
+                                    task_index, model_t, provider_t, note
+                                )
+                                f.write(json.dumps(fail_rec, ensure_ascii=False) + "\n")
+                                written_count += 1
+                            done = task_index + 1
+                            _print_progress(done, total, start_time, model_t)
+                            if args.topic_file:
+                                _save_progress_state(out_path, done, total, topic_file=args.topic_file)
+                        except Exception as e:
+                            print("  Warning: %s" % e)
+                        time.sleep(args.delay)
+                    print()
     else:
         print("Provide --topics, --topic-file, or --pair-from (or --generate-from .jsonl). See --help.")
         return 1

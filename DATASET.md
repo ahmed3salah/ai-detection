@@ -70,6 +70,38 @@ Use `--before-year 2021` to reduce chance of LLM-assisted writing. Use `--append
 | **Using local Ollama** | any | `--provider ollama --model llama3.2` (Ollama running on localhost) |
 | **From topic file** | e.g. `ai_abstracts.txt` | `python scripts/generate_ai_data.py --topic-file dataset/topics.txt --output dataset/ai_abstracts.txt` |
 
+### AI arXiv-style JSONL (`--output` ending in `.jsonl`)
+
+Topic-file runs that write JSONL assign `id` values `ai-0`, `ai-1`, … aligned with the task index (cycling topics and, with `--multi-model`, models in order). Rows must pass shared checks in `scripts/ai_jsonl_quality.py`: non-empty **title** and usable **abstract** (length, no model JSON narration, heavy LaTeX/homework patterns, etc.), and by default non-empty **categories**. Use `--no-require-categories` to allow empty categories.
+
+- **Retries:** `--max-retries` (default 3) re-calls the model when validation fails.
+- **Failure log:** JSON lines are appended to `<output_stem>.failures.jsonl` by default for topic-file JSONL runs (override with `--failure-log`).
+- **Placeholder rows:** If validation still fails, a row with `generation_failed: 1` is written so line indices stay stable unless you pass `--skip-failure-rows` (not recommended if you rely on `ai-N` ids).
+
+**Audit (split clean vs rejected)**
+
+```bash
+python scripts/audit_ai_jsonl.py audit --input dataset/ai_abstracts_20k.jsonl
+```
+
+Default outputs: `dataset/ai_abstracts_20k.cleaned.jsonl` and `dataset/ai_abstracts_20k.rejected.jsonl` (override with `--output-clean` / `--output-rejects`).
+
+**Regenerate only some indices** (use the same `--topic-file`, `--target`, `--multi-model`, and `--models` ordering as the original batch). `reject_indices.txt` is one integer per line (or pass a comma-separated list):
+
+```bash
+python scripts/generate_ai_data.py --topic-file dataset/topics.txt --regenerate-indices reject_indices.txt \
+  --output dataset/ai_regen_patch.jsonl --provider openrouter --multi-model
+```
+
+**Merge patch back into the full file**
+
+```bash
+python scripts/audit_ai_jsonl.py merge --base dataset/ai_abstracts_20k.jsonl --patch dataset/ai_regen_patch.jsonl \
+  --output dataset/ai_abstracts_20k.merged.jsonl --validate --still-bad dataset/still_bad.jsonl
+```
+
+Save the exact command line used for large runs (topic file path, `--target`, `--models`, `--workers`, `--delay`) so regeneration stays reproducible.
+
 ---
 
 ## 4. Single JSONL (alternative)
