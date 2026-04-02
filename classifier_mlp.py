@@ -150,7 +150,7 @@ def load_classifier(
 ) -> Any:
     """
     Load the trained classifier for inference.
-    - If config has classifier_type == "pytorch" and model.pt exists, load PyTorch MLP and return wrapper.
+    - Prefer model.pt when classifier_type is pytorch, or when only model.pt exists (current training).
     - Otherwise load model.pkl (legacy RandomForest) with joblib.
     Returns an object with predict_proba(X) and predict(X) (numpy in/out).
     """
@@ -158,22 +158,40 @@ def load_classifier(
 
     config_path = Path(config_path)
     model_dir = Path(model_dir)
-    if not config_path.exists():
-        pkl_path = model_dir / "model.pkl"
-        if pkl_path.exists():
-            return joblib.load(pkl_path)
-        raise FileNotFoundError("No model_config.pkl and no model.pkl. Run training first.")
+    pt_path = model_dir / "model.pt"
+    pkl_path = model_dir / "model.pkl"
 
-    config = joblib.load(config_path)
-    if config.get("classifier_type") == "pytorch":
-        pt_path = model_dir / "model.pt"
-        if not pt_path.exists():
-            raise FileNotFoundError("config says classifier_type=pytorch but model.pt not found. Run training.")
+    def _load_pt() -> PyTorchClassifierWrapper:
         device = get_device()
         model = load_mlp(pt_path, device=device)
         return PyTorchClassifierWrapper(model, device)
 
-    pkl_path = model_dir / "model.pkl"
-    if not pkl_path.exists():
-        raise FileNotFoundError("No model.pkl. Run training first.")
-    return joblib.load(pkl_path)
+    if not config_path.exists():
+        if pt_path.exists():
+            return _load_pt()
+        if pkl_path.exists():
+            return joblib.load(pkl_path)
+        raise FileNotFoundError(
+            "No model_config.pkl and no model artifacts. Place model.pt (+ model_config.pkl) or model.pkl in %s."
+            % model_dir.resolve()
+        )
+
+    config = joblib.load(config_path)
+    use_pytorch = config.get("classifier_type") == "pytorch"
+    # Current training only saves model.pt; old configs may omit classifier_type
+    if not use_pytorch and pt_path.exists() and not pkl_path.exists():
+        use_pytorch = True
+
+    if use_pytorch:
+        if not pt_path.exists():
+            raise FileNotFoundError(
+                "model_config.pkl expects PyTorch but model.pt not found in %s. Run training or copy model.pt."
+                % model_dir.resolve()
+            )
+        return _load_pt()
+
+    if pkl_path.exists():
+        return joblib.load(pkl_path)
+    if pt_path.exists():
+        return _load_pt()
+    raise FileNotFoundError("No model.pkl or model.pt in %s. Run training first." % model_dir.resolve())
