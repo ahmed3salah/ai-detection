@@ -10,9 +10,10 @@ warnings.filterwarnings("ignore", message="trust_remote_code", category=UserWarn
 from pathlib import Path
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
 import joblib
 import torch
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
 
 from features import (
     extract_features,
@@ -37,6 +38,11 @@ def train(
     use_tfidf: bool = False,
     max_tfidf_features: int = 5000,
     arxiv_metadata_max_samples: int = 100_000,
+    learning_rate: float = 3e-4,
+    weight_decay: float = 1e-4,
+    use_feature_scaler: bool = True,
+    batch_size: int = 64,
+    n_epochs: int = 40,
 ):
     """
     Load data (local dataset/ by default, or IDMGSP with --idmgsp), extract features,
@@ -121,24 +127,48 @@ def train(
         X_train_feat = X_train_dense
         X_val_feat = X_val_dense if X_val else None
 
+    n_bad = int(np.sum(~np.isfinite(X_train_feat)))
+    if n_bad:
+        print(f"[Training] Warning: {n_bad} non-finite values in train features; sanitizing.")
+    X_train_feat = np.nan_to_num(X_train_feat, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64)
+    if X_val_feat is not None:
+        X_val_feat = np.nan_to_num(X_val_feat, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64)
+
+    scaler_path = Path("feature_scaler.pkl")
+    if use_feature_scaler:
+        scaler = StandardScaler()
+        X_train_feat = scaler.fit_transform(X_train_feat).astype(np.float64)
+        if X_val_feat is not None:
+            X_val_feat = scaler.transform(X_val_feat).astype(np.float64)
+        X_train_feat = np.nan_to_num(X_train_feat, nan=0.0, posinf=10.0, neginf=-10.0)
+        if X_val_feat is not None:
+            X_val_feat = np.nan_to_num(X_val_feat, nan=0.0, posinf=10.0, neginf=-10.0)
+        joblib.dump(scaler, scaler_path)
+        print(f"[Training] Saved {scaler_path} (zero-mean unit-variance features for stable MLP training).")
+    else:
+        if scaler_path.exists():
+            scaler_path.unlink()
+            print(f"[Training] Removed {scaler_path} (--no-feature-scaler).")
+
     y_train_arr = np.array(y_train, dtype=np.float32)
     n_features = X_train_feat.shape[1]
     print(f"[Training] Feature matrix: {X_train_feat.shape[0]} samples, {n_features} features")
 
     device = get_device()
     print_device_status("Classifier")
-    print(f"[Training] Classifier training: device={device}, batch_size=64, n_epochs=40")
+    print(
+        f"[Training] Classifier training: device={device}, batch_size={batch_size}, "
+        f"n_epochs={n_epochs}, lr={learning_rate}, weight_decay={weight_decay}"
+    )
 
     torch.manual_seed(random_state)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(random_state)
 
     model = MLPClassifier(input_size=n_features, hidden_size=128).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = torch.nn.BCEWithLogitsLoss()
 
-    batch_size = 64
-    n_epochs = 40
     X_t = torch.from_numpy(X_train_feat.astype(np.float32))
     y_t = torch.from_numpy(y_train_arr.reshape(-1, 1).astype(np.float32))
     for epoch in range(n_epochs):
@@ -153,10 +183,14 @@ def train(
             optimizer.zero_grad()
             logits = model(xb).unsqueeze(1)
             loss = criterion(logits, yb)
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    "Non-finite loss in a training batch. Check for bad labels/features, or retry with a lower --lr."
+                )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            epoch_loss += loss.item()
+            epoch_loss += float(loss.item())
             n_batches += 1
         avg_loss = epoch_loss / n_batches if n_batches else 0.0
         if (epoch + 1) % 5 == 0 or epoch == 0:
@@ -191,6 +225,7 @@ def train(
         "idmgsp_subset": idmgsp_subset if use_idmgsp else None,
         "idmgsp_text_mode": idmgsp_text_mode if use_idmgsp else None,
         "classifier_type": "pytorch",
+        "use_feature_scaler": use_feature_scaler,
     }
     joblib.dump(config, "model_config.pkl")
 
@@ -228,6 +263,15 @@ if __name__ == "__main__":
     p.add_argument("--arxiv-max-samples", type=int, default=100_000,
                    help="Max samples from arxiv-metadata-pre-llm.jsonl (default 100000). 0 = skip.")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--lr", type=float, default=3e-4, help="Adam learning rate (default 3e-4)")
+    p.add_argument("--weight-decay", type=float, default=1e-4, help="Adam L2 penalty (default 1e-4)")
+    p.add_argument("--batch-size", type=int, default=64, help="Training batch size")
+    p.add_argument("--epochs", type=int, default=40, help="Training epochs")
+    p.add_argument(
+        "--no-feature-scaler",
+        action="store_true",
+        help="Disable StandardScaler on features (not recommended; large word counts can destabilize the MLP).",
+    )
     args = p.parse_args()
     train(
         use_idmgsp=args.idmgsp,
@@ -241,4 +285,9 @@ if __name__ == "__main__":
         use_tfidf=args.tfidf,
         max_tfidf_features=args.max_tfidf,
         arxiv_metadata_max_samples=args.arxiv_max_samples,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        use_feature_scaler=not args.no_feature_scaler,
+        batch_size=args.batch_size,
+        n_epochs=args.epochs,
     )

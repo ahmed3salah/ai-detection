@@ -2,6 +2,7 @@
 Feature extraction for AI vs human scientific text.
 Includes generic style + scientific-domain (passive, hedging, diversity, structure).
 """
+import math
 import re
 import subprocess
 import sys
@@ -154,6 +155,19 @@ def _empty_features(include_perplexity=False):
     return [0.0] * n
 
 
+def _sanitize_ppl_log(ppl, log_ppl, cap=1e6, log_cap=20.0):
+    """Finite perplexity features for the MLP (NaN/Inf from LM forward breaks training)."""
+    if not math.isfinite(ppl) or ppl <= 0:
+        ppl = cap
+    else:
+        ppl = min(float(ppl), cap)
+    if not math.isfinite(log_ppl):
+        log_ppl = log_cap
+    else:
+        log_ppl = min(float(log_ppl), log_cap)
+    return ppl, log_ppl
+
+
 def extract_features_with_perplexity(text, model_type="scibert", aggregate="mean"):
     """
     Extract feature vector including perplexity and log(perplexity) for classifier.
@@ -163,9 +177,7 @@ def extract_features_with_perplexity(text, model_type="scibert", aggregate="mean
     try:
         from detector import get_perplexity_for_features
         ppl, log_ppl = get_perplexity_for_features(text, model_type=model_type, aggregate=aggregate)
-        # Clip extreme values for stability
-        ppl = min(ppl, 1e6) if ppl != float("inf") else 1e6
-        log_ppl = min(log_ppl, 20.0) if log_ppl != float("inf") else 20.0
+        ppl, log_ppl = _sanitize_ppl_log(ppl, log_ppl)
         return base + [ppl, log_ppl]
     except Exception:
         return base + [0.0, 0.0]
@@ -182,10 +194,8 @@ def extract_features_with_dual_perplexity(text, aggregate="mean"):
         ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert = get_perplexity_for_features_dual(
             text, aggregate=aggregate
         )
-        ppl_gpt2 = min(ppl_gpt2, 1e6) if ppl_gpt2 != float("inf") else 1e6
-        log_ppl_gpt2 = min(log_ppl_gpt2, 20.0) if log_ppl_gpt2 != float("inf") else 20.0
-        ppl_scibert = min(ppl_scibert, 1e6) if ppl_scibert != float("inf") else 1e6
-        log_ppl_scibert = min(log_ppl_scibert, 20.0) if log_ppl_scibert != float("inf") else 20.0
+        ppl_gpt2, log_ppl_gpt2 = _sanitize_ppl_log(ppl_gpt2, log_ppl_gpt2)
+        ppl_scibert, log_ppl_scibert = _sanitize_ppl_log(ppl_scibert, log_ppl_scibert)
         return base + [ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert]
     except Exception:
         return base + [0.0, 0.0, 0.0, 0.0]

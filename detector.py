@@ -78,23 +78,18 @@ def _get_scibert():
     return _SCIBERT_MODEL, _SCIBERT_TOKENIZER
 
 
-def _chunk_text(tokenizer, text, max_length):
-    """Split text into chunks of at most max_length tokens (by sentences when possible)."""
-    enc = tokenizer(text, truncation=False, return_tensors=None, add_special_tokens=False)
-    ids = enc.get("input_ids") or tokenizer.encode(text, add_special_tokens=False)
-    if len(ids) <= max_length:
-        return [text]
-    # Simple token-based chunking
-    chunks = []
-    start = 0
-    while start < len(ids):
-        end = min(start + max_length, len(ids))
-        chunk_ids = ids[start:end]
-        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True)
-        if chunk_text.strip():
-            chunks.append(chunk_text)
-        start = end
-    return chunks if chunks else [text]
+def _long_doc_token_ids(tokenizer, text: str, char_window: int = 4000) -> List[int]:
+    """
+    Full-document token id sequence without one huge tokenizer() call (avoids HF length warnings
+    and reduces edge-case failures on very long inputs).
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    ids: List[int] = []
+    for i in range(0, len(text), char_window):
+        ids.extend(tokenizer.encode(text[i : i + char_window], add_special_tokens=False))
+    return ids
 
 
 def calculate_perplexity(text, model_type="gpt2", aggregate="mean"):
@@ -121,17 +116,21 @@ def calculate_perplexity(text, model_type="gpt2", aggregate="mean"):
 def _perplexity_gpt2(text, aggregate):
     model, tokenizer = _get_gpt2()
     device = next(model.parameters()).device
-    chunks = _chunk_text(tokenizer, text, GPT2_MAX_LENGTH)
+    all_ids = _long_doc_token_ids(tokenizer, text)
+    if not all_ids:
+        return float("inf")
     perps = []
     with torch.no_grad():
-        for chunk in chunks:
-            enc = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=GPT2_MAX_LENGTH)
-            if enc["input_ids"].numel() == 0:
+        for start in range(0, len(all_ids), GPT2_MAX_LENGTH):
+            chunk_ids = all_ids[start : start + GPT2_MAX_LENGTH]
+            if not chunk_ids:
                 continue
-            enc = {k: v.to(device) for k, v in enc.items()}
-            outputs = model(**enc, labels=enc["input_ids"])
+            input_ids = torch.tensor([chunk_ids], dtype=torch.long, device=device)
+            outputs = model(input_ids=input_ids, labels=input_ids)
             loss = outputs.loss
-            perps.append(torch.exp(loss).item())
+            val = torch.exp(loss).item()
+            if math.isfinite(val):
+                perps.append(min(val, 1e6))
     if not perps:
         return float("inf")
     if aggregate == "min":
@@ -143,36 +142,41 @@ def _perplexity_scibert(text, aggregate):
     """Pseudo-perplexity from MLM: forward with labels=input_ids, perplexity = exp(loss)."""
     model, tokenizer = _get_scibert()
     device = next(model.parameters()).device
-    chunks = _chunk_text(tokenizer, text, MAX_LENGTH)
+    all_ids = _long_doc_token_ids(tokenizer, text)
+    if not all_ids:
+        return float("inf")
     perps = []
     with torch.no_grad():
-        for chunk in chunks:
-            enc = tokenizer(
-                chunk,
-                return_tensors="pt",
-                truncation=True,
+        for start in range(0, len(all_ids), MAX_LENGTH):
+            chunk_ids = all_ids[start : start + MAX_LENGTH]
+            if not chunk_ids:
+                continue
+            enc = tokenizer.prepare_for_model(
+                chunk_ids,
                 max_length=MAX_LENGTH,
                 padding="max_length",
+                truncation=True,
+                return_tensors="pt",
                 return_special_tokens_mask=True,
             )
             input_ids = enc["input_ids"].to(device)
             attention_mask = enc.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
-            # Mask padding and special tokens so we don't count them in loss
             labels = input_ids.clone()
-            if "attention_mask" in enc:
-                labels[enc["attention_mask"] == 0] = -100
-            if enc.get("special_tokens_mask") is not None:
-                labels[enc["special_tokens_mask"].bool()] = -100
-            labels = labels.to(device)
-            # Only pass model-accepted kwargs (no special_tokens_mask)
+            if attention_mask is not None:
+                labels[attention_mask == 0] = -100
+            stm = enc.get("special_tokens_mask")
+            if stm is not None:
+                labels[stm.to(device).bool()] = -100
             model_kw = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
             if "token_type_ids" in enc:
                 model_kw["token_type_ids"] = enc["token_type_ids"].to(device)
             outputs = model(**model_kw)
             loss = outputs.loss
-            perps.append(torch.exp(loss).item())
+            val = torch.exp(loss).item()
+            if math.isfinite(val):
+                perps.append(min(val, 1e6))
     if not perps:
         return float("inf")
     if aggregate == "min":

@@ -25,6 +25,8 @@ MAX_CHARS = {
 _classifier = None
 _config = None
 _vectorizer = None
+_feature_scaler = None
+_feature_scaler_checked = False
 _feature_mismatch_detail: Optional[str] = None
 
 
@@ -47,6 +49,20 @@ def _get_vectorizer():
         else:
             _vectorizer = False  # mark as "not used"
     return _vectorizer if _vectorizer else None
+
+
+def _get_feature_scaler():
+    """StandardScaler from training; must match model.pt trained with use_feature_scaler."""
+    global _feature_scaler, _feature_scaler_checked
+    if _feature_scaler_checked:
+        return _feature_scaler
+    _feature_scaler_checked = True
+    if not _get_config().get("use_feature_scaler", True):
+        return None
+    path = Path("feature_scaler.pkl")
+    if path.exists():
+        _feature_scaler = joblib.load(path)
+    return _feature_scaler
 
 
 def _prepare_text(text: str, detection_type: str) -> str:
@@ -82,6 +98,10 @@ def _build_features(text: str, config: dict):
             feat = dense
     else:
         feat = dense
+
+    scaler = _get_feature_scaler()
+    if scaler is not None:
+        feat = scaler.transform(feat)
 
     return feat
 

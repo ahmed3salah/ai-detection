@@ -52,6 +52,16 @@ def build_features(texts, config):
     return dense
 
 
+def _apply_feature_scaler(X: np.ndarray, config: dict) -> np.ndarray:
+    if not config.get("use_feature_scaler", True):
+        return X
+    path = Path("feature_scaler.pkl")
+    if not path.exists():
+        return X
+    scaler = joblib.load(path)
+    return scaler.transform(X)
+
+
 def evaluate(
     idmgsp_subset: str = "classifier_input",
     text_mode: str = "abstract",
@@ -96,6 +106,7 @@ def evaluate(
         raise ValueError("No test/val data. Use --dataset-dir dataset (default) or add data in dataset/.")
 
     X_feat = build_features(X_test, config)
+    X_feat = _apply_feature_scaler(X_feat, config)
     y_pred = model.predict(X_feat)
     y_true = np.array(y_test)
 
