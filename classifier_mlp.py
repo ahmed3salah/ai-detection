@@ -114,8 +114,19 @@ class PyTorchClassifierWrapper:
 # -----------------------------------------------------------------------------
 
 
+def assert_mlp_weights_finite(model: MLPClassifier, context: str = "MLP") -> None:
+    """Raise if any parameter is NaN/Inf (diverged training); avoids saving unusable checkpoints."""
+    for name, p in model.named_parameters():
+        if not torch.isfinite(p).all():
+            raise RuntimeError(
+                f"{context}: parameter '{name}' contains NaN or Inf. "
+                "Do not deploy this checkpoint — retrain with a lower learning rate and/or gradient clipping."
+            )
+
+
 def save_mlp(model: MLPClassifier, path: Union[str, Path]) -> None:
     """Save state_dict and input_size so the model can be reconstructed."""
+    assert_mlp_weights_finite(model, "Refusing to save")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(

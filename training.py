@@ -154,6 +154,7 @@ def train(
             logits = model(xb).unsqueeze(1)
             loss = criterion(logits, yb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_loss += loss.item()
             n_batches += 1
@@ -171,6 +172,9 @@ def train(
             print(f"Epoch {epoch + 1}/{n_epochs} validation accuracy: {val_acc:.4f}")
 
     # Save PyTorch model and config (no model.pkl)
+    from classifier_mlp import assert_mlp_weights_finite
+
+    assert_mlp_weights_finite(model, "After training")
     Path("model.pt").parent.mkdir(parents=True, exist_ok=True)
     save_mlp(model, "model.pt")
     print(f"[Training] Saved model.pt (device used: {device})")

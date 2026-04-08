@@ -3,8 +3,16 @@ Perplexity (and optional entropy) for AI detection.
 Supports GPT-2 (general) and SciBERT (science-domain); long text via chunking.
 Production detection: paragraph-level decisions + whole-text AI percentage.
 """
+import logging
+import math
+import os
 import re
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# When set (e.g. DETECTION_DEBUG=1), failed segment entries include error_class (exception type name).
+_DEBUG_SEGMENTS = os.environ.get("DETECTION_DEBUG", "").strip().lower() in ("1", "true", "yes")
 
 import torch
 
@@ -265,6 +273,22 @@ def split_paragraphs(
     return paragraphs
 
 
+def _clamp_unit_prob(x: float) -> float:
+    """Probability in [0, 1] for JSON/API; non-finite values become 0."""
+    if not math.isfinite(x):
+        return 0.0
+    return max(0.0, min(1.0, float(x)))
+
+
+def _perplexity_for_json(p: Optional[float]) -> Optional[float]:
+    """JSON-safe perplexity: omit non-finite or non-positive values."""
+    if p is None:
+        return None
+    if not math.isfinite(p) or p <= 0:
+        return None
+    return round(min(float(p), 1e9), 6)
+
+
 def _perplexity_to_ai_signal(perplexity: float, ref_perplexity: float = 50.0) -> float:
     """
     Map perplexity to a 0–1 "AI-like" signal. Lower perplexity → smoother text → higher signal.
@@ -312,7 +336,9 @@ def run_detection(
         perplexity_value: If set, use this instead of computing (e.g. from caller).
 
     Returns:
-        dict with decision, ai_percentage, confidence, paragraphs, raw_overall_prob, perplexity, etc.
+        dict with decision, ai_percentage, confidence, paragraphs, raw_overall_prob, perplexity,
+        classifier_overall (pre-blend), perplexity_ai_signal (when used), classifier_segments_failed,
+        and per-paragraph scoring_ok (False if classifier raised).
     """
     paragraphs = split_paragraphs(
         text,
@@ -329,34 +355,58 @@ def run_detection(
             "paragraphs": [],
             "raw_overall_prob": 0.0,
             "perplexity": None,
+            "classifier_overall": 0.0,
+            "perplexity_ai_signal": None,
+            "classifier_segments_failed": 0,
             "message": "No sufficient text to analyze.",
         }
 
     para_results: List[Dict[str, Any]] = []
     probs: List[float] = []
     lengths: List[int] = []
+    classifier_segments_failed = 0
 
     for i, para in enumerate(paragraphs):
+        scoring_ok = True
+        error_class: Optional[str] = None
         try:
             feats = build_features_fn(para)
-            prob_ai = float(classifier.predict_proba(feats)[0, 1])
-        except Exception:
+            prob_ai = _clamp_unit_prob(float(classifier.predict_proba(feats)[0, 1]))
+        except Exception as e:
+            scoring_ok = False
+            classifier_segments_failed += 1
             prob_ai = 0.0
+            error_class = type(e).__name__
+            preview_dbg = (para[:60] + "…") if len(para) > 60 else para
+            logger.exception(
+                "Classifier scoring failed for paragraph index=%d preview=%r",
+                i + 1,
+                preview_dbg,
+            )
         probs.append(prob_ai)
         lengths.append(len(para))
         decision = "ai" if prob_ai >= decision_threshold else "human"
         preview = (para[:preview_len] + "…") if len(para) > preview_len else para
-        para_results.append({
+        # scoring_ok distinguishes "model predicted ~0" from "classifier did not run" (see plan).
+        seg: Dict[str, Any] = {
             "index": i + 1,
             "text_preview": preview.strip(),
-            "ai_probability": round(prob_ai, 4),
+            "ai_probability": round(_clamp_unit_prob(prob_ai), 6),
             "decision": decision,
-        })
+            "scoring_ok": scoring_ok,
+        }
+        if _DEBUG_SEGMENTS and not scoring_ok and error_class is not None:
+            seg["error_class"] = error_class
+        para_results.append(seg)
 
     if weight_by_length and sum(lengths) > 0:
         classifier_overall = sum(p * L for p, L in zip(probs, lengths)) / sum(lengths)
     else:
         classifier_overall = sum(probs) / len(probs) if probs else 0.0
+    if not math.isfinite(classifier_overall):
+        classifier_overall = 0.0
+    else:
+        classifier_overall = max(0.0, min(1.0, float(classifier_overall)))
 
     # Perplexity: compute for full text if not provided, then blend into decision
     if perplexity_value is not None:
@@ -369,12 +419,19 @@ def run_detection(
     else:
         ppl = None
 
-    if use_perplexity and ppl is not None and ppl > 0:
+    perplexity_ai_signal: Optional[float] = None
+    if use_perplexity and ppl is not None and math.isfinite(ppl) and ppl > 0:
         ppl_signal = _perplexity_to_ai_signal(ppl, ref_perplexity)
+        perplexity_ai_signal = round(ppl_signal, 6)
         raw_overall = (1.0 - perplexity_weight) * classifier_overall + perplexity_weight * ppl_signal
         raw_overall = max(0.0, min(1.0, raw_overall))
     else:
         raw_overall = classifier_overall
+
+    if not math.isfinite(raw_overall):
+        raw_overall = 0.5
+    else:
+        raw_overall = max(0.0, min(1.0, float(raw_overall)))
 
     ai_percentage = round(100.0 * raw_overall, 2)
     decision = "ai" if raw_overall >= decision_threshold else "human"
@@ -395,7 +452,10 @@ def run_detection(
         "paragraph_count": len(paragraphs),
         "paragraphs": para_results,
         "raw_overall_prob": round(raw_overall, 4),
-        "perplexity": round(ppl, 6) if ppl is not None else None,
+        "perplexity": _perplexity_for_json(ppl),
+        "classifier_overall": round(classifier_overall, 6),
+        "perplexity_ai_signal": perplexity_ai_signal,
+        "classifier_segments_failed": classifier_segments_failed,
         "message": (
             f"The text is classified as **{decision.upper()}** with an estimated "
             f"**{ai_percentage}%** likelihood of being AI-generated (confidence: {confidence})."

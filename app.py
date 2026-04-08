@@ -1,7 +1,10 @@
 import warnings
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL", category=UserWarning)
 
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 import joblib
@@ -10,7 +13,7 @@ import numpy as np
 from features import extract_features, extract_features_with_perplexity, extract_features_with_dual_perplexity
 from classifier_mlp import load_classifier
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
 
 # Approximate max length by type (chars) for truncation when input is very long
 MAX_CHARS = {
@@ -22,19 +25,7 @@ MAX_CHARS = {
 _classifier = None
 _config = None
 _vectorizer = None
-
-
-def _get_classifier():
-    global _classifier
-    if _classifier is None:
-        try:
-            _classifier = load_classifier(config_path="model_config.pkl", model_dir=".")
-        except FileNotFoundError as e:
-            raise HTTPException(
-                status_code=503,
-                detail="Model not trained yet. Run training first to create model.pt or model.pkl.",
-            ) from e
-    return _classifier
+_feature_mismatch_detail: Optional[str] = None
 
 
 def _get_config():
@@ -93,6 +84,137 @@ def _build_features(text: str, config: dict):
         feat = dense
 
     return feat
+
+
+def _load_config_for_features() -> dict:
+    path = Path("model_config.pkl")
+    if not path.exists():
+        return {}
+    return joblib.load(path)
+
+
+def _pytorch_feature_dimension_error(clf: Any) -> Optional[str]:
+    """If clf is PyTorch MLP wrapper, ensure feature width matches model.input_size."""
+    from classifier_mlp import PyTorchClassifierWrapper
+
+    if not isinstance(clf, PyTorchClassifierWrapper):
+        return None
+    expected = int(clf.model.input_size)
+    cfg = _load_config_for_features()
+    dummy = "This is a short sample abstract for dimension validation."
+    feat = _build_features(dummy, cfg)
+    got = int(feat.shape[1])
+    if got != expected:
+        return (
+            f"Feature dimension mismatch: model expects {expected}, inference produces {got}. "
+            "Align model.pt with model_config.pkl and tfidf_vectorizer.pkl."
+        )
+    return None
+
+
+def _sklearn_feature_dimension_error(clf: Any) -> Optional[str]:
+    """If clf is a fitted sklearn estimator with n_features_in_, match inference feature width."""
+    from classifier_mlp import PyTorchClassifierWrapper
+
+    if isinstance(clf, PyTorchClassifierWrapper):
+        return None
+    raw = getattr(clf, "n_features_in_", None)
+    if raw is None:
+        return None
+    # MagicMock defines __index__ → 1; only trust real integer-like sklearn values.
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        expected = raw
+    elif isinstance(raw, np.integer):
+        expected = int(raw)
+    else:
+        return None
+    cfg = _load_config_for_features()
+    dummy = "This is a short sample abstract for dimension validation."
+    feat = _build_features(dummy, cfg)
+    got = int(feat.shape[1])
+    if got != expected:
+        return (
+            f"Feature dimension mismatch: estimator (e.g. RandomForest in model.pkl) expects {expected} "
+            f"features, inference produces {got}. "
+            "Set model_config.pkl to match training (use_perplexity_features, use_dual_perplexity, use_tfidf) "
+            "or retrain with training.py using the current feature pipeline."
+        )
+    return None
+
+
+def _feature_dimension_error(clf: Any) -> Optional[str]:
+    """Return a user-facing error string if loaded classifier does not match _build_features width."""
+    err = _pytorch_feature_dimension_error(clf)
+    if err is not None:
+        return err
+    return _sklearn_feature_dimension_error(clf)
+
+
+def _pytorch_weights_corrupted_error(clf: Any) -> Optional[str]:
+    """Detect NaN/Inf in MLP weights (diverged training); otherwise outputs become NaN and look like P(AI)=0."""
+    import torch
+
+    from classifier_mlp import PyTorchClassifierWrapper
+
+    if not isinstance(clf, PyTorchClassifierWrapper):
+        return None
+    for p in clf.model.parameters():
+        if not torch.isfinite(p).all():
+            return (
+                "model.pt contains non-finite weights (NaN/Inf), usually from a diverged training run. "
+                "Retrain with training.py (e.g. lower --lr, enable gradient clipping). "
+                "The API was returning ai_probability 0.0 because invalid outputs were sanitized for JSON."
+            )
+    return None
+
+
+def _classifier_load_error(clf: Any) -> Optional[str]:
+    return (
+        _feature_dimension_error(clf)
+        or _pytorch_weights_corrupted_error(clf)
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _classifier, _feature_mismatch_detail
+    _feature_mismatch_detail = None
+    try:
+        clf = load_classifier(config_path="model_config.pkl", model_dir=".")
+    except FileNotFoundError:
+        yield
+        return
+    err = _classifier_load_error(clf)
+    if err:
+        _feature_mismatch_detail = err
+        logger.critical("%s", err)
+    else:
+        _classifier = clf
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def _get_classifier():
+    global _classifier
+    if _feature_mismatch_detail is not None:
+        raise HTTPException(status_code=503, detail=_feature_mismatch_detail)
+    if _classifier is None:
+        try:
+            clf = load_classifier(config_path="model_config.pkl", model_dir=".")
+        except FileNotFoundError as e:
+            raise HTTPException(
+                status_code=503,
+                detail="Model not trained yet. Run training first to create model.pt or model.pkl.",
+            ) from e
+        err = _classifier_load_error(clf)
+        if err is not None:
+            raise HTTPException(status_code=503, detail=err)
+        _classifier = clf
+    return _classifier
 
 
 async def _parse_detect_input(request: Request):
@@ -168,5 +290,8 @@ async def detect(request: Request):
         "paragraphs": result["paragraphs"],
         "raw_overall_prob": result["raw_overall_prob"],
         "perplexity": result.get("perplexity"),
+        "classifier_overall": result.get("classifier_overall"),
+        "perplexity_ai_signal": result.get("perplexity_ai_signal"),
+        "classifier_segments_failed": result.get("classifier_segments_failed", 0),
         "detection_type": detection_type,
     }
