@@ -6,17 +6,20 @@ of real arxiv-metadata-pre-llm.jsonl records into a single JSONL file.
 Usage (defaults are tailored to this repo):
 
   python -m scripts.merge_ai_and_real_jsonl \
-    --output dataset/ai_plus_real_70k.jsonl
+    --output dataset/ai_plus_real_130k.jsonl
 
 This will:
 - Read AI records from:
+    - dataset/ai_abstracts_30k.jsonl
     - dataset/ai_abstracts_20k.jsonl
     - dataset/ai_from_topics_5k.jsonl
     - dataset/ai_generated_test_10k.jsonl
 - Build a normalized title set from all AI records.
-- Stream over dataset/arxiv-metadata-pre-llm.jsonl and reservoir-sample
-  `--real-sample-size` records (default 35000) whose titles do not
-  collide with the AI title set.
+- Stream over dataset/arxiv-metadata-pre-llm-sample-65k.jsonl (or
+  `--arxiv-file`) and reservoir-sample `--real-sample-size` records
+  (default 65000) whose titles do not collide with the AI title set.
+  Point `--arxiv-file` at the full arxiv-metadata-pre-llm.jsonl if you
+  want to draw from the entire corpus instead of the fixed 65k pool.
 - Map real arxiv records into the same schema as the AI JSONL records,
   with ai_written=0 and simple model/provider tags.
 - Optionally shuffle the merged records before writing.
@@ -50,12 +53,13 @@ from ai_jsonl_quality import (  # type: ignore[import]
 DATASET_DIR = PROJECT_ROOT / "dataset"
 
 DEFAULT_AI_FILES = [
+    DATASET_DIR / "ai_abstracts_30k.jsonl",
     DATASET_DIR / "ai_abstracts_20k.jsonl",
     DATASET_DIR / "ai_from_topics_5k.jsonl",
     DATASET_DIR / "ai_generated_test_10k.jsonl",
 ]
 
-DEFAULT_ARXIV_FILE = DATASET_DIR / "arxiv-metadata-pre-llm.jsonl"
+DEFAULT_ARXIV_FILE = DATASET_DIR / "arxiv-metadata-pre-llm-sample-65k.jsonl"
 
 
 def _norm_title(title: str) -> str:
@@ -223,19 +227,22 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--arxiv-file",
         type=Path,
         default=DEFAULT_ARXIV_FILE,
-        help="Path to arxiv-metadata-pre-llm.jsonl (default: dataset/arxiv-metadata-pre-llm.jsonl).",
+        help=(
+            "Path to arxiv JSONL (default: dataset/arxiv-metadata-pre-llm-sample-65k.jsonl). "
+            "Use dataset/arxiv-metadata-pre-llm.jsonl to sample from the full corpus."
+        ),
     )
     p.add_argument(
         "--real-sample-size",
         type=int,
-        default=35000,
-        help="Number of real arxiv records to sample (default: 35000).",
+        default=65000,
+        help="Number of real arxiv records to sample (default: 65000).",
     )
     p.add_argument(
         "--output",
         type=Path,
-        default=DATASET_DIR / "ai_plus_real_70k.jsonl",
-        help="Output JSONL path (default: dataset/ai_plus_real_70k.jsonl).",
+        default=DATASET_DIR / "ai_plus_real_130k.jsonl",
+        help="Output JSONL path (default: dataset/ai_plus_real_130k.jsonl).",
     )
     p.add_argument(
         "--seed",

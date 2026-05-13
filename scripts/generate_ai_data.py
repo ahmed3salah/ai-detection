@@ -146,6 +146,20 @@ def get_client_ollama(base_url: Optional[str] = None, **kwargs):
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
+def _openrouter_extra_body_for_model(model: str) -> Optional[Dict[str, Any]]:
+    """
+    Reasoning models (R1, o-series) often fill max_tokens with chain-of-thought in `content`,
+    leaving no room for JSON metadata. OpenRouter can keep reasoning server-side.
+    See: https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+    """
+    ml = (model or "").lower()
+    if "deepseek-r1" in ml:
+        return {"reasoning": {"exclude": True}}
+    if "openai/o1" in ml or "openai/o3" in ml or "openai/o4" in ml:
+        return {"reasoning": {"exclude": True}}
+    return None
+
+
 def get_client_openrouter(api_key: Optional[str] = None, base_url: Optional[str] = None):
     """Use OpenRouter (openrouter.ai) — single API for many models (OpenAI, Anthropic, Google, etc.)."""
     try:
@@ -160,7 +174,17 @@ def get_client_openrouter(api_key: Optional[str] = None, base_url: Optional[str]
         url = url + "/v1" if "/v1" not in url else url
     client = openai.OpenAI(api_key=key, base_url=url)
     def complete(prompt, model, max_tokens=300, temperature=0.7):
-        return _complete_openai(client, prompt, model, max_tokens, temperature)
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        extra = _openrouter_extra_body_for_model(model)
+        if extra:
+            kwargs["extra_body"] = extra
+        resp = client.chat.completions.create(**kwargs)
+        return (resp.choices[0].message.content or "").strip()
     return complete
 
 
@@ -171,21 +195,21 @@ PROVIDERS = {
     "google": (get_client_google, "gemini-1.5-flash"),
     "gemini": (get_client_google, "gemini-1.5-flash"),
     "ollama": (get_client_ollama, "llama3.2"),
-    "openrouter": (get_client_openrouter, "openai/gpt-4o-mini"),  # OpenRouter: use any model id e.g. anthropic/claude-3-5-haiku
+    "openrouter": (get_client_openrouter, "openai/gpt-5.4-mini"),  # OpenRouter: use any model id from openrouter.ai/models
     "openai_compatible": (get_client_openai, "gpt-4o-mini"),  # Any OpenAI-compatible (Together, Groq, vLLM)
 }
 
 # Default models for --multi-model (OpenRouter IDs; split across providers for diverse training data)
-# Kept current as of 2025: Gemini 2.5, Llama 3.3, DeepSeek R1, and latest Claude/GPT-4o.
+# Aligned with OpenRouter catalog as of 2026. DeepSeek slot uses V3.2 (not R1): JSON metadata prompts need non-reasoning output.
 DEFAULT_OPENROUTER_MODELS = [
-    "openai/gpt-4o-mini",
-    "openai/gpt-4o",
-    "anthropic/claude-3-5-haiku",
-    "anthropic/claude-3-5-sonnet",
-    "google/gemini-2.5-flash",
-    "meta-llama/llama-3.3-70b-instruct",
-    "mistralai/mistral-large",
-    "deepseek/deepseek-r1",
+    "openai/gpt-5.4-mini",
+    "openai/gpt-5.4",
+    "anthropic/claude-haiku-4.5",
+    "anthropic/claude-sonnet-4.6",
+    "google/gemini-3.1-flash-lite-preview",
+    "meta-llama/llama-4-maverick",
+    "mistralai/mistral-large-2512",
+    "deepseek/deepseek-v3.2",
 ]
 
 
@@ -794,7 +818,7 @@ Providers and env vars:
   anthropic          ANTHROPIC_API_KEY       Claude
   google / gemini    GOOGLE_API_KEY or GEMINI_API_KEY
   ollama             (no key)                local, OLLAMA_BASE_URL=http://localhost:11434/v1
-  openrouter         OPENROUTER_API_KEY     single API for many models (e.g. openai/gpt-4o-mini, anthropic/claude-3-5-haiku)
+  openrouter         OPENROUTER_API_KEY     single API for many models (e.g. openai/gpt-5.4-mini, anthropic/claude-sonnet-4.6)
   openai_compatible  OPENAI_API_KEY + OPENAI_API_BASE   Together, Groq, vLLM, etc.
 """,
     )
@@ -827,8 +851,8 @@ Providers and env vars:
     p.add_argument("--multi-model", action="store_true",
                    help="Use multiple models via OpenRouter; samples are split round-robin across models for diverse training.")
     p.add_argument("--models", default=None,
-                   help="Comma-separated OpenRouter model IDs for --multi-model (e.g. openai/gpt-4o-mini,anthropic/claude-3-5-haiku). "
-                        "Default: 9 popular models (OpenAI, Anthropic, Google, Meta, Mistral, DeepSeek).")
+                   help="Comma-separated OpenRouter model IDs for --multi-model (e.g. openai/gpt-5.4-mini,anthropic/claude-haiku-4.5). "
+                        "Default: 8 models (OpenAI, Anthropic, Google, Meta, Mistral, DeepSeek).")
     p.add_argument("--max-retries", type=int, default=3,
                    help="Retries per sample when validation fails (topic JSONL and --regenerate-indices). Default: 3")
     p.add_argument("--failure-log", type=Path, default=None,
@@ -1212,38 +1236,51 @@ Providers and env vars:
                                 topic_failure_log,
                             )
                         )
-                    batch_results: List[Tuple[int, Optional[Tuple], List[str], str, str]] = []
+                    # Write in task_index order as soon as each prefix is complete (do not buffer all
+                    # futures — otherwise the output file stays empty until the full run finishes).
+                    idx_to_model = {p[0]: p[3] for p in payloads}
+                    pending: Dict[int, Tuple[Optional[Tuple], List[str], str, str]] = {}
+                    next_write = 0
                     with ThreadPoolExecutor(max_workers=workers) as executor:
                         futures = {executor.submit(_worker_topic_indexed, p): p[0] for p in payloads}
                         for fut in as_completed(futures):
+                            task_index = futures[fut]
                             try:
-                                batch_results.append(fut.result())
+                                _, row, reasons, model_t, provider_t = fut.result()
                             except Exception as e:
                                 print("  Warning: %s" % e)
-                    for task_index, row, reasons, model_t, provider_t in sorted(
-                        batch_results, key=lambda x: x[0]
-                    ):
-                        try:
-                            if row:
-                                _write_one_result(f, row, task_index, is_jsonl, model, args.provider)
-                                written_count += 1
-                            elif (
-                                is_jsonl
-                                and want_metadata
-                                and not args.skip_failure_rows
-                            ):
-                                note = ",".join(reasons) if reasons else "unknown"
-                                fail_rec = build_generation_failed_record(
-                                    task_index, model_t, provider_t, note
-                                )
-                                f.write(json.dumps(fail_rec, ensure_ascii=False) + "\n")
-                                written_count += 1
-                            done = task_index + 1
-                            _print_progress(done, total, start_time, model_t)
-                            if args.topic_file:
-                                _save_progress_state(out_path, done, total, topic_file=args.topic_file)
-                        except Exception as e:
-                            print("  Warning: %s" % e)
+                                model_t = idx_to_model.get(task_index, model)
+                                row, reasons = None, ["worker_exception:%s" % e]
+                                provider_t = args.provider
+                            pending[task_index] = (row, reasons, model_t, provider_t)
+                            while next_write in pending:
+                                row, reasons, model_t, provider_t = pending.pop(next_write)
+                                try:
+                                    if row:
+                                        _write_one_result(
+                                            f, row, next_write, is_jsonl, model, args.provider
+                                        )
+                                        written_count += 1
+                                    elif (
+                                        is_jsonl
+                                        and want_metadata
+                                        and not args.skip_failure_rows
+                                    ):
+                                        note = ",".join(reasons) if reasons else "unknown"
+                                        fail_rec = build_generation_failed_record(
+                                            next_write, model_t, provider_t, note
+                                        )
+                                        f.write(json.dumps(fail_rec, ensure_ascii=False) + "\n")
+                                        written_count += 1
+                                    done = next_write + 1
+                                    _print_progress(done, total, start_time, model_t)
+                                    if args.topic_file:
+                                        _save_progress_state(
+                                            out_path, done, total, topic_file=args.topic_file
+                                        )
+                                except Exception as e:
+                                    print("  Warning: %s" % e)
+                                next_write += 1
                     print()
                 else:
                     for t in tasks:
