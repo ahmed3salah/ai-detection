@@ -30,3 +30,8 @@ dataset/*.jsonl
 # OS
 .DS_Store
 Thumbs.db
+
+old/*
+model.pt
+model_config.pkl
+feature_scaler.pkl
