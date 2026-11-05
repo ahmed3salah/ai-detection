@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TEI xmlns="http://www.tei-c.org/ns/1.0">
+  <teiHeader>
+    <profileDesc>
+      <abstract><div><p coords="1,10,10,100,20">We study how sparse retrieval behaves when the corpus grows far beyond the size of the index it was tuned on, and we report the conditions under which simple caching recovers most of the lost throughput without any change to the ranking function, which matters for deployed systems.</p></div></abstract>
+    </profileDesc>
+  </teiHeader>
+  <text>
+    <body>
+      <div><head n="1">Introduction</head>
+        <p coords="1,1,1,1,1">Short opener line.</p>
+        <p coords="1,2,2,2,2">Retrieval systems rarely see the corpus they were tuned on for long <ref type="bibr" target="#b1">[1]</ref>, because documents arrive continuously and the distribution of queries shifts with them. Operators respond by rebuilding indexes on a schedule, yet rebuilds are expensive and the gains fade within weeks, so a cheaper way of keeping latency stable is worth having.</p>
+        <figure xml:id="fig_0"><head>Fig. 1.</head><figDesc><p>Caption text that is not prose and should never be scored by anyone reading this.</p></figDesc></figure>
+        <formula xml:id="formula_0">x = y^2</formula>
+        <note place="foot"><p>A footnote that is not part of the body prose either, and should be left out.</p></note>
+      </div>
+      <div><head n="2">Method</head>
+        <p>We replay production query logs against three index sizes <formula>k = 3</formula> and record tail latency for each one, repeating every run five times so that the variance between runs can be separated from the effect of the cache itself, which turned out to be much smaller than we expected at first.</p>
+        <p>A trailing fragment here.</p>
+        <div><head>2.1 Settings</head>
+          <p>The cache holds the postings of the most frequent terms, and it is warmed from the previous day's log before each run begins, so that a cold start does not dominate the measurements that we report in the sections below.</p>
+        </div>
+      </div>
+      <div><head n="3">Results</head>
+        <p>Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next. Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next. Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next. Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next. Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next.</p>
+      </div>
+      <div><p>A paragraph with no heading anywhere around it, long enough to stay on its own after the merge step has had its turn, and written as ordinary prose so that the section stays null all the way through to the final output of the splitter.</p></div>
+    </body>
+    <back><div type="references"><listBibl><biblStruct><analytic><title>A cited work</title></analytic></biblStruct></listBibl></div></back>
+  </text>
+</TEI>

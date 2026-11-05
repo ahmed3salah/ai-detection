@@ -1,0 +1,10 @@
+This first paragraph explains the problem at some length, because a paragraph needs at least forty words before the merge step leaves it alone, and pasted text has no section headings to keep paragraphs apart from each other at all, which matters here.
+
+Tiny line.
+
+A second para-
+graph follows the tiny one and absorbs it, since they sit in the same block and the short one comes first in reading order, and it also rejoins a word that was broken across a line end by the PDF.
+
+References
+
+[1] A. Author. A cited work that should never be scored. 2020.

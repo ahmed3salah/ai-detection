@@ -1,0 +1,66 @@
+{
+    "tei": [
+        {
+            "kind": "abstract",
+            "section": "Abstract",
+            "coords": "1,10,10,100,20",
+            "text": "We study how sparse retrieval behaves when the corpus grows far beyond the size of the index it was tuned on, and we report the conditions under which simple caching recovers most of the lost throughput without any change to the ranking function, which matters for deployed systems."
+        },
+        {
+            "kind": "paragraph",
+            "section": "1 Introduction",
+            "coords": "1,1,1,1,1",
+            "text": "Short opener line. Retrieval systems rarely see the corpus they were tuned on for long [1], because documents arrive continuously and the distribution of queries shifts with them. Operators respond by rebuilding indexes on a schedule, yet rebuilds are expensive and the gains fade within weeks, so a cheaper way of keeping latency stable is worth having."
+        },
+        {
+            "kind": "paragraph",
+            "section": "2 Method",
+            "coords": null,
+            "text": "We replay production query logs against three index sizes and record tail latency for each one, repeating every run five times so that the variance between runs can be separated from the effect of the cache itself, which turned out to be much smaller than we expected at first. A trailing fragment here."
+        },
+        {
+            "kind": "paragraph",
+            "section": "2.1 Settings",
+            "coords": null,
+            "text": "The cache holds the postings of the most frequent terms, and it is warmed from the previous day's log before each run begins, so that a cold start does not dominate the measurements that we report in the sections below."
+        },
+        {
+            "kind": "paragraph",
+            "section": "3 Results",
+            "coords": null,
+            "text": "Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next. Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next."
+        },
+        {
+            "kind": "paragraph",
+            "section": "3 Results",
+            "coords": null,
+            "text": "Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next. Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next."
+        },
+        {
+            "kind": "paragraph",
+            "section": "3 Results",
+            "coords": null,
+            "text": "Caching the postings of frequent terms lowered tail latency at every index size we tried. The improvement was largest on the biggest index, where it recovered about 60 percent of the lost throughput. Smaller indexes gained less, since most of their queries were already fast before the cache was added. Writes were unaffected, because the cache is only consulted on the read path of the system. Eviction rarely mattered in practice, which suggests the working set of terms is stable from one day to the next."
+        },
+        {
+            "kind": "paragraph",
+            "section": null,
+            "coords": null,
+            "text": "A paragraph with no heading anywhere around it, long enough to stay on its own after the merge step has had its turn, and written as ordinary prose so that the section stays null all the way through to the final output of the splitter."
+        }
+    ],
+    "text": [
+        {
+            "kind": "paragraph",
+            "section": null,
+            "coords": null,
+            "text": "This first paragraph explains the problem at some length, because a paragraph needs at least forty words before the merge step leaves it alone, and pasted text has no section headings to keep paragraphs apart from each other at all, which matters here."
+        },
+        {
+            "kind": "paragraph",
+            "section": null,
+            "coords": null,
+            "text": "Tiny line. A second paragraph follows the tiny one and absorbs it, since they sit in the same block and the short one comes first in reading order, and it also rejoins a word that was broken across a line end by the PDF."
+        }
+    ]
+}
