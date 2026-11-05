@@ -2,11 +2,13 @@ import warnings
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL", category=UserWarning)
 
 import logging
+import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 import joblib
 import numpy as np
 
@@ -218,6 +220,42 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _safe_compare_secret(provided: str, expected: str) -> bool:
+    if not provided or not expected or len(provided) != len(expected):
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+def _verify_detection_api_key(request: Request) -> None:
+    """When DETECTION_API_KEY is set, require Bearer token or X-Api-Key header."""
+    expected = (os.environ.get("DETECTION_API_KEY") or "").strip()
+    if not expected:
+        return
+    auth = request.headers.get("authorization") or ""
+    bearer = ""
+    if auth.lower().startswith("bearer "):
+        bearer = auth[7:].strip()
+    x_key = (request.headers.get("x-api-key") or "").strip()
+    if _safe_compare_secret(bearer, expected) or _safe_compare_secret(x_key, expected):
+        return
+    raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+@app.get("/health")
+def health():
+    """Liveness: process is up (does not verify model load)."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Readiness: classifier loaded and consistent with feature pipeline."""
+    if _feature_mismatch_detail is not None:
+        raise HTTPException(status_code=503, detail=_feature_mismatch_detail)
+    _get_classifier()
+    return {"ready": True}
+
+
 def _get_classifier():
     global _classifier
     if _feature_mismatch_detail is not None:
@@ -263,7 +301,7 @@ async def _parse_detect_input(request: Request):
 
 
 @app.post("/detect")
-async def detect(request: Request):
+async def detect(request: Request, _: None = Depends(_verify_detection_api_key)):
     """
     Detect likelihood that text is AI-generated (production).
     - Splits text into paragraphs (and by sentences for long single-block text).

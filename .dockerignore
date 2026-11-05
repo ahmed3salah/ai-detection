@@ -1,0 +1,26 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+*.pyc
+.Python
+.env
+.env.*
+*.env
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+dataset
+old
+tests
+
+# Prefer placing inference artifacts under model/ for builds; ignore root copies by mistake
+model.pt
+model.pkl
+model_config.pkl
+feature_scaler.pkl
+tfidf_vectorizer.pkl

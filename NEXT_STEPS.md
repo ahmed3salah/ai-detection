@@ -138,3 +138,9 @@ A **15k human** sample has been created from the full arxiv file:
    ```bash
    python3 training.py --dataset-dir dataset
    ```
+
+---
+
+## Container deployment
+
+For Docker build, ECS/Fargate, health checks, and `DETECTION_API_KEY`, see **[DEPLOY.md](DEPLOY.md)** and **[model/ARTIFACTS.md](model/ARTIFACTS.md)**.
