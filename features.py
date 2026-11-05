@@ -2,6 +2,7 @@
 Feature extraction for AI vs human scientific text.
 Includes generic style + scientific-domain (passive, hedging, diversity, structure).
 """
+import logging
 import math
 import re
 import subprocess
@@ -9,6 +10,8 @@ import sys
 
 import numpy as np
 import spacy
+
+logger = logging.getLogger(__name__)
 
 # Hedging cues common in scientific writing (AI may over/under-use)
 HEDGING_WORDS = {
@@ -68,7 +71,11 @@ def extract_features(text):
     if not text:
         return _empty_features()
 
-    doc = _get_nlp()(text)
+    return _features_from_doc(text, _get_nlp()(text))
+
+
+def _features_from_doc(text, doc):
+    """The feature vector of already stripped, non-empty text and its spaCy doc."""
     sentences = list(doc.sents)
     words = [t.text for t in doc if t.is_alpha]
     word_count = len(words)
@@ -199,6 +206,67 @@ def extract_features_with_dual_perplexity(text, aggregate="mean"):
         return base + [ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert]
     except Exception:
         return base + [0.0, 0.0, 0.0, 0.0]
+
+
+def _style_feature_rows(texts):
+    """extract_features for many texts; a text spaCy could not read is None."""
+    stripped = [(text or "").strip() for text in texts]
+    rows = [None if text else _empty_features() for text in stripped]
+    pending = [index for index, text in enumerate(stripped) if text]
+    nlp_model = _get_nlp()
+    try:
+        docs = list(nlp_model.pipe(stripped[index] for index in pending))
+    except Exception:
+        # One text can break a whole pipe; read them one by one so it only costs that text.
+        docs = []
+        for index in pending:
+            try:
+                docs.append(nlp_model(stripped[index]))
+            except Exception:
+                logger.exception("spaCy failed for text index=%d", index)
+                docs.append(None)
+    for index, doc in zip(pending, docs):
+        if doc is not None:
+            rows[index] = _features_from_doc(stripped[index], doc)
+    return rows
+
+
+def extract_feature_rows(texts, dual_perplexity=False, perplexity=False, measure_perplexity=True, batch_size=None):
+    """
+    Feature vectors for many texts, in the layout of extract_features_with_dual_perplexity /
+    extract_features_with_perplexity / extract_features.
+
+    A text whose features could not be measured is None. The single-text functions fall back
+    to zeros instead, which the classifier would score as if they were real measurements.
+
+    measure_perplexity=False fills the perplexity slots with zeros without running the language
+    models, for a model that was trained on zeros there.
+    """
+    from detector import batch_perplexity
+
+    rows = _style_feature_rows(texts)
+    if dual_perplexity:
+        model_types = ["gpt2", "scibert"]
+    elif perplexity:
+        model_types = ["scibert"]
+    else:
+        model_types = []
+
+    if not measure_perplexity:
+        padding = [0.0, 0.0] * len(model_types)
+        return [None if row is None else row + padding for row in rows]
+
+    for model_type in model_types:
+        values = batch_perplexity(texts, model_type=model_type, batch_size=batch_size)
+        for index, ppl in enumerate(values):
+            if rows[index] is None:
+                continue
+            if ppl is None:
+                rows[index] = None
+                continue
+            log_ppl = float("inf") if ppl <= 0 else math.log(ppl) if math.isfinite(ppl) else float("inf")
+            rows[index] = rows[index] + list(_sanitize_ppl_log(ppl, log_ppl))
+    return rows
 
 
 # For config and debugging: ordered feature names (base only; + perplexity, log_perplexity when used)

@@ -98,6 +98,8 @@ If the task sets `MODEL_S3_URI` in production, you can ship an image **without**
 - **Networking**: Prefer tasks in **private** subnets; expose **ALB** with **HTTPS (ACM)**. If the bucket is only reachable privately, ensure **VPC S3 endpoint** or routing allows `GetObject`/`ListBucket` from the task subnets.
 - **Secrets**: Set **`DETECTION_API_KEY`** from **AWS Secrets Manager** (or SSM) in the task definition; do not bake secrets into the image.
 - **Environment**: Do not unset `HF_HOME` or `TRANSFORMERS_OFFLINE` unless you intentionally want runtime Hub access.
+- **Concurrency**: each process runs one inference at a time; a request that waits longer than `DETECTION_INFERENCE_WAIT_SECONDS` (default 30) gets a **503**, which callers retry. To serve more at once, raise `WEB_CONCURRENCY` (uvicorn worker processes). Each process loads its own models, so size task memory for it, and set `OMP_NUM_THREADS` to about vCPUs / workers so they don't fight over cores.
+- **Paragraph scoring**: `POST /v2/score-segments` takes at most `DETECTION_MAX_SEGMENTS` segments and `DETECTION_MAX_TOTAL_CHARS` characters (413 above that). `GET /v2/model-info` reports the serving model and the limits. `calibrated: false` means the bands are provisional.
 
 ## GPU
 

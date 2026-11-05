@@ -139,7 +139,15 @@ def _perplexity_gpt2(text, aggregate):
 
 
 def _perplexity_scibert(text, aggregate):
-    """Pseudo-perplexity from MLM: forward with labels=input_ids, perplexity = exp(loss)."""
+    """
+    Pseudo-perplexity from MLM: forward with labels=input_ids, perplexity = exp(loss).
+
+    Under transformers 4.57 this raises (prepare_for_model cannot build a special tokens mask
+    with a fast tokenizer), and callers fall back: features become zeros, /detect skips its
+    perplexity blend. The deployed model.pt was trained on those zeros (feature_scaler.pkl has
+    mean 0 and scale 1 for all four perplexity features), so do NOT fix this on its own: real
+    values would go through weights that never saw them. It needs a retrain.
+    """
     model, tokenizer = _get_scibert()
     device = next(model.parameters()).device
     all_ids = _long_doc_token_ids(tokenizer, text)
@@ -206,6 +214,119 @@ def get_perplexity_for_features_dual(text, aggregate="mean"):
     log_ppl_gpt2 = float("inf") if ppl_gpt2 <= 0 else math.log(ppl_gpt2)
     log_ppl_scibert = float("inf") if ppl_scibert <= 0 else math.log(ppl_scibert)
     return ppl_gpt2, log_ppl_gpt2, ppl_scibert, log_ppl_scibert
+
+
+# --- Batched perplexity: same windows and formula as _perplexity_gpt2 / _perplexity_scibert ---
+
+LM_BATCH_SIZE = max(1, int(os.environ.get("DETECTION_LM_BATCH_SIZE", "8")))
+
+
+def _pad_windows(windows: List[List[int]], pad_id: int, device) -> tuple:
+    """Right-pad token windows into (input_ids, attention_mask) tensors."""
+    longest = max(len(w) for w in windows)
+    input_ids = torch.full((len(windows), longest), pad_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((len(windows), longest), dtype=torch.long, device=device)
+    for row, window in enumerate(windows):
+        input_ids[row, : len(window)] = torch.tensor(window, dtype=torch.long, device=device)
+        attention_mask[row, : len(window)] = 1
+    return input_ids, attention_mask
+
+
+def _mean_token_perplexity(logits, labels) -> List[float]:
+    """exp(mean cross-entropy) per row, ignoring -100 labels; NaN for a row with no labels."""
+    losses = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view(labels.size())
+    counts = (labels != -100).sum(dim=1)
+    return torch.exp(losses.sum(dim=1) / counts).tolist()
+
+
+def _gpt2_window_perplexities(model, tokenizer, windows: List[List[int]]) -> List[float]:
+    device = next(model.parameters()).device
+    input_ids, attention_mask = _pad_windows(windows, tokenizer.eos_token_id, device)
+    labels = input_ids.masked_fill(attention_mask == 0, -100)
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    return _mean_token_perplexity(logits[:, :-1, :], labels[:, 1:])
+
+
+def _scibert_window_perplexities(model, tokenizer, windows: List[List[int]]) -> List[float]:
+    device = next(model.parameters()).device
+    encoded = [tokenizer.build_inputs_with_special_tokens(window[: MAX_LENGTH - 2]) for window in windows]
+    input_ids, attention_mask = _pad_windows(encoded, tokenizer.pad_token_id, device)
+    labels = input_ids.masked_fill(attention_mask == 0, -100)
+    for row, ids in enumerate(encoded):
+        # [CLS] and [SEP] are not predicted.
+        labels[row, 0] = -100
+        labels[row, len(ids) - 1] = -100
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    return _mean_token_perplexity(logits, labels)
+
+
+def batch_perplexity(
+    texts: List[str],
+    model_type: str = "gpt2",
+    batch_size: Optional[int] = None,
+) -> List[Optional[float]]:
+    """
+    calculate_perplexity(text, model_type, aggregate="mean") for many texts in micro-batches.
+
+    A text that failed is None rather than a number, so a caller can tell "could not be
+    measured" from a real perplexity. A failed micro-batch is retried one window at a time,
+    so one bad window fails one text. Nothing about the text itself is logged: these are
+    unpublished manuscripts.
+    """
+    scibert = model_type == "scibert"
+    model, tokenizer = _get_scibert() if scibert else _get_gpt2()
+    window_size = MAX_LENGTH if scibert else GPT2_MAX_LENGTH
+    measure = _scibert_window_perplexities if scibert else _gpt2_window_perplexities
+    batch_size = batch_size or LM_BATCH_SIZE
+
+    failed = set()
+    windows = []  # (text index, token ids)
+    for index, text in enumerate(texts):
+        try:
+            ids = _long_doc_token_ids(tokenizer, text)
+        except Exception:
+            logger.exception("Tokenizing failed for text index=%d (%s)", index, model_type)
+            failed.add(index)
+            continue
+        windows.extend((index, ids[start : start + window_size]) for start in range(0, len(ids), window_size))
+
+    def measure_slice(batch) -> None:
+        for (index, _), value in zip(batch, measure(model, tokenizer, [ids for _, ids in batch])):
+            if math.isfinite(value):
+                values[index].append(min(value, 1e6))
+
+    values: Dict[int, List[float]] = {index: [] for index in range(len(texts))}
+    # Similar lengths share a batch, so short paragraphs don't pay for padding to a long one.
+    windows.sort(key=lambda window: len(window[1]))
+    for start in range(0, len(windows), batch_size):
+        batch = windows[start : start + batch_size]
+        try:
+            measure_slice(batch)
+        except Exception:
+            logger.exception("Perplexity micro-batch failed (%s); retrying its windows one by one", model_type)
+            for window in batch:
+                try:
+                    measure_slice([window])
+                except Exception:
+                    logger.exception("Perplexity failed for text index=%d (%s)", window[0], model_type)
+                    failed.add(window[0])
+
+    results: List[Optional[float]] = []
+    for index in range(len(texts)):
+        if index in failed:
+            results.append(None)
+        elif values[index]:
+            results.append(sum(values[index]) / len(values[index]))
+        else:
+            results.append(float("inf"))
+    return results
 
 
 # --- Production: paragraph-level detection + whole-text decision ---

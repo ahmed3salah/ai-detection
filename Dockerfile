@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/root/.cache/huggingface \
 
 ENV TRANSFORMERS_OFFLINE=1
 
-COPY app.py classifier_mlp.py detector.py features.py ./
+COPY app.py classifier_mlp.py detector.py features.py segment_scoring.py ./
 COPY scripts/sync_model_from_s3.py scripts/sync_model_from_s3.py
 # CI/local: optional baked-in weights; production often uses MODEL_S3_URI at startup instead.
 COPY model/ ./
