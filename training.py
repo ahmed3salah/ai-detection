@@ -2,6 +2,9 @@
 Train the AI-detection classifier.
 Uses local data in dataset/ by default (human + AI text or data.jsonl).
 Use --idmgsp only if you have datasets<3.0 and want the IDMGSP benchmark.
+
+Do not use this for paragraph models: use train_segments.py. This script hides feature failures
+(it trained the deployed model on four columns of zeros) and overwrites model.pt in the repo root.
 """
 import warnings
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL", category=UserWarning)

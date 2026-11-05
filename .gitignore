@@ -35,3 +35,6 @@ old/*
 model.pt
 model_config.pkl
 feature_scaler.pkl
+
+# Trained models: train_segments.py writes here, and S3 is where they ship from
+artifacts/

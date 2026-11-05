@@ -24,6 +24,7 @@ from features import (
 )
 from classifier_mlp import load_classifier
 import segment_scoring
+from text_normalize import normalize_segment
 
 logger = logging.getLogger(__name__)
 
@@ -161,13 +162,26 @@ def _build_feature_batch(texts: List[str], config: dict) -> Tuple[np.ndarray, Li
     _build_features for many texts: the feature matrix of the texts that could be measured,
     and each row's index into texts.
     """
+    # Only for a model trained on normalized text. The deployed one saw raw abstracts, so cleaning
+    # its input would change the features it was trained on.
+    normalizing = bool(config.get("text_normalization"))
+    if normalizing:
+        texts = [normalize_segment(text) for text in texts]
+
     rows = extract_feature_rows(
         texts,
         dual_perplexity=config.get("use_dual_perplexity", False),
         perplexity=config.get("use_perplexity_features", True),
         measure_perplexity=_model_learned_from_perplexity(config),
     )
-    kept = [i for i, row in enumerate(rows) if row is not None and np.isfinite(row).all()]
+    kept = [
+        i
+        for i, row in enumerate(rows)
+        if row is not None
+        and np.isfinite(row).all()
+        # Nothing left once cleaned: unscored, not a row of zeros the model would read as text.
+        and (not normalizing or texts[i])
+    ]
     if not kept:
         return np.zeros((0, 0), dtype=np.float64), []
 
