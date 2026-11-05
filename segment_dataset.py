@@ -38,6 +38,21 @@ class DatasetError(ValueError):
     """The dataset cannot be trained on as it stands."""
 
 
+def read_jsonl(path: Union[str, Path]) -> List[Row]:
+    """
+    Rows of a JSONL file. Always UTF-8, never the system's encoding (cp1252 on Windows), and split
+    only on real line ends: str.splitlines would also break a row at a raw U+2028 in its text.
+    """
+    with Path(path).open(encoding="utf-8", newline="\n") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def append_jsonl(path: Union[str, Path], rows: Iterable[Row]) -> None:
+    with Path(path).open("a", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def load_segments(path: Union[str, Path]) -> Tuple[List[Row], str]:
     """The dataset's rows and the sha256 of the file, which every artifact records."""
     path = Path(path)

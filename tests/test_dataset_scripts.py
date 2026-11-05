@@ -445,11 +445,48 @@ class LeakCheckTest(unittest.TestCase):
         self.assertTrue(report["passed"], report)
 
 
+class EncodingTest(unittest.TestCase):
+    """The GPU machine runs Windows, whose default encoding (cp1252) can't hold most of this text."""
+
+    def test_jsonl_round_trips_any_text_and_splits_only_on_real_line_ends(self):
+        from segment_dataset import append_jsonl, read_jsonl
+
+        rows = [{"text": "\u03b1-helix\u2028next \u4e2d\u6587 \x85 caf\u00e9"}, {"text": "second"}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rows.jsonl"
+            append_jsonl(path, rows[:1])
+            append_jsonl(path, rows[1:])
+            self.assertEqual(read_jsonl(path), rows)
+            self.assertNotIn(b"\r", path.read_bytes())
+
+    def test_no_script_uses_the_systems_default_encoding(self):
+        import ast
+
+        files = [ROOT / "scripts" / f"{name}.py" for name in ("build_human_paragraphs", "generate_ai_paragraphs", "merge_segments", "leak_check", "check_human_paragraphs")]
+        files += [ROOT / name for name in ("segment_dataset.py", "segmenter.py", "segment_model.py", "train_segments.py", "evaluate_segments.py")]
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                if name in ("read_text", "write_text"):
+                    self.assertIn("encoding", [k.arg for k in node.keywords], f"{path.name}:{node.lineno}")
+                if name == "open":
+                    mode = next((a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)), "r")
+                    if "b" not in mode:
+                        self.assertIn("encoding", [k.arg for k in node.keywords], f"{path.name}:{node.lineno}")
+
+    def test_an_arxiv_page_is_read_as_utf8_from_bytes(self):
+        page = arxiv_page([("2001.00001", "2020-01-01", BY, "cs.LG")]).replace("Paper 2001.00001", "\u03b1-stable caf\u00e9")
+        candidates, _, _ = human.parse_arxiv_records(('<?xml version="1.0" encoding="UTF-8"?>' + page).encode("utf-8"))
+        self.assertEqual(candidates[0].title, "\u03b1-stable caf\u00e9")
+
+
 class GrobidCheckTest(unittest.TestCase):
     def test_a_page_that_is_not_tei_is_a_failure_not_an_empty_paper(self):
         class Answer:
             status_code = 206
-            text = "<!DOCTYPE html><html><body>Preparing Space</body></html>"
+            content = b"<!DOCTYPE html><html><body>Preparing Space</body></html>"
 
             def raise_for_status(self):
                 pass

@@ -22,12 +22,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import segmenter  # noqa: E402
+from segment_dataset import append_jsonl, read_jsonl  # noqa: E402
 
 ARXIV_OAI = "https://oaipmh.arxiv.org/oai"
 ARXIV_PDF = "https://export.arxiv.org/pdf/{id}"
@@ -119,7 +120,7 @@ def arxiv_first_year(identifier: str) -> Optional[int]:
     return 1900 + year if year >= 91 else 2000 + year
 
 
-def parse_arxiv_records(xml: str) -> Tuple[List[Candidate], Optional[str], int]:
+def parse_arxiv_records(xml: Union[str, bytes]) -> Tuple[List[Candidate], Optional[str], int]:
     """Eligible papers on a page of arXiv OAI-PMH, its resumption token, and how many records it had."""
     root = ET.fromstring(xml)
     candidates = []
@@ -169,7 +170,7 @@ def jats_licence(article: ET.Element) -> str:
     return ""
 
 
-def parse_pmc_records(xml: str) -> Tuple[List[Candidate], Optional[str], int]:
+def parse_pmc_records(xml: Union[str, bytes]) -> Tuple[List[Candidate], Optional[str], int]:
     root = ET.fromstring(xml)
     candidates = []
     records = [element for element in root.iter() if local_name(element) == "record"]
@@ -302,7 +303,9 @@ def harvest(fetcher: Fetcher, domain: str, rng: random.Random) -> Iterator[Candi
             params = {"verb": "ListRecords", "metadataPrefix": "arXiv", "set": domain, "from": start.isoformat(), "until": end.isoformat()}
 
         for _ in range(3):  # Up to three pages of a week, then on to another week.
-            xml = fetcher.get(url, params).text
+            # Bytes, so the XML parser reads the encoding: arXiv sends text/xml with no charset,
+            # which requests would decode as Latin-1 and garble.
+            xml = fetcher.get(url, params).content
             candidates, token, _ = parse(xml)
             rng.shuffle(candidates)
             yield from candidates
@@ -325,9 +328,10 @@ def grobid_tei(session: requests.Session, grobid_url: str, pdf: bytes, attempts:
             time.sleep(5 * (attempt + 1))
             continue
         response.raise_for_status()
-        if "<TEI" not in response.text[:2000]:
+        tei = response.content.decode("utf-8", errors="replace")
+        if "<TEI" not in tei[:2000]:
             raise RuntimeError("GROBID did not answer with TEI.")
-        return response.text
+        return tei
     raise RuntimeError("GROBID stayed busy.")
 
 
@@ -350,8 +354,8 @@ def quotas(total: int, weights: Dict[str, float]) -> Dict[str, int]:
 
 def process_arxiv(candidate: Candidate, pdf_path: Path, tei_path: Path, grobid_url: str, session: requests.Session) -> List[segmenter.Segment]:
     if not tei_path.exists():
-        tei_path.write_text(grobid_tei(session, grobid_url, pdf_path.read_bytes()))
-    return segmenter.from_tei(tei_path.read_text())
+        tei_path.write_text(grobid_tei(session, grobid_url, pdf_path.read_bytes()), encoding="utf-8")
+    return segmenter.from_tei(tei_path.read_text(encoding="utf-8"))
 
 
 def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
@@ -364,8 +368,7 @@ def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
     done: Dict[str, str] = {}
     accepted: Dict[str, int] = {domain: 0 for domain in DOMAIN_WEIGHTS}
     if log_path.exists():
-        for line in log_path.read_text().splitlines():
-            entry = json.loads(line)
+        for entry in read_jsonl(log_path):
             done[entry["paper_id"]] = entry["status"]
             if entry["status"] == "ok":
                 accepted[entry["quota"]] = accepted.get(entry["quota"], 0) + 1
@@ -382,11 +385,8 @@ def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
     def record(candidate: Candidate, quota: str, segments: Optional[List[segmenter.Segment]], error: str = "") -> None:
         rows = rows_for(candidate, segments or [])
         status = "ok" if rows else ("failed" if error else "too_few_paragraphs")
-        with output.open("a") as out:
-            for row in rows:
-                out.write(json.dumps(row, ensure_ascii=False) + "\n")
-        with log_path.open("a") as log:
-            log.write(json.dumps({"paper_id": candidate.paper_id, "quota": quota, "status": status, "paragraphs": len(rows), "error": error[:200]}) + "\n")
+        append_jsonl(output, rows)
+        append_jsonl(log_path, [{"paper_id": candidate.paper_id, "quota": quota, "status": status, "paragraphs": len(rows), "error": error[:200]}])
         done[candidate.paper_id] = status
         stats[quota]["accepted" if rows else "failed"] += 1
         print(f"[human] {candidate.paper_id:28s} {status:20s} {len(rows):4d} paragraphs   {quota}: {stats[quota]['accepted']}/{targets[quota]}", flush=True)

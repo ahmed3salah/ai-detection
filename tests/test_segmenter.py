@@ -16,7 +16,7 @@ class MatchesProductionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.maxDiff = None
-        cls.expected = json.loads((FIXTURES / "expected.json").read_text())
+        cls.expected = json.loads((FIXTURES / "expected.json").read_text(encoding="utf-8"))
 
     def test_the_fixture_exercises_every_rule(self):
         sections = [s["section"] for s in self.expected["tei"]]
@@ -29,10 +29,10 @@ class MatchesProductionTest(unittest.TestCase):
         self.assertIn("Short opener line.", text)
 
     def test_tei_matches_the_php_output(self):
-        self.assertEqual(shape(segmenter.from_tei((FIXTURES / "manuscript.tei.xml").read_text())), self.expected["tei"])
+        self.assertEqual(shape(segmenter.from_tei((FIXTURES / "manuscript.tei.xml").read_text(encoding="utf-8"))), self.expected["tei"])
 
     def test_plain_text_matches_the_php_output(self):
-        self.assertEqual(shape(segmenter.from_text((FIXTURES / "pasted.txt").read_text())), self.expected["text"])
+        self.assertEqual(shape(segmenter.from_text((FIXTURES / "pasted.txt").read_text(encoding="utf-8"))), self.expected["text"])
 
     def test_something_that_is_not_tei_reads_as_nothing(self):
         self.assertEqual(segmenter.from_tei("<html><body>Preparing Space</body></html>"), [])

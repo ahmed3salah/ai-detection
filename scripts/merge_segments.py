@@ -9,9 +9,13 @@ length. Prints the comparison to read before spending on the full run.
 import argparse
 import json
 import statistics
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from segment_dataset import append_jsonl, read_jsonl  # noqa: E402
 
 KEEP = ("id", "text", "label", "paper_id", "domain", "section", "generator", "test_set", "mode")
 
@@ -66,10 +70,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     workdir = Path(args.workdir)
-    read = lambda name: [json.loads(line) for line in (workdir / name).read_text().splitlines() if line.strip()]
-    rows = merge(read("human_segments.jsonl"), read("ai_segments.jsonl"))
+    rows = merge(read_jsonl(workdir / "human_segments.jsonl"), read_jsonl(workdir / "ai_segments.jsonl"))
     out = Path(args.out or workdir / "segments.jsonl")
-    out.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+    out.unlink(missing_ok=True)
+    append_jsonl(out, rows)
     print(json.dumps(describe(rows), indent=2))
     print(f"Wrote {out}")
     return 0

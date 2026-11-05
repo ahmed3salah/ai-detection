@@ -32,7 +32,7 @@ import requests
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from segment_dataset import TEST, assign_paper  # noqa: E402
+from segment_dataset import TEST, append_jsonl, assign_paper, read_jsonl  # noqa: E402
 
 OPENROUTER_CHAT = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
@@ -85,10 +85,6 @@ def stable_fraction(*parts: object) -> float:
 def task_id(prefix: str, *parts: str) -> str:
     """Deterministic, so a rerun recognises what it has already tried."""
     return f"{prefix}-{hashlib.sha256('|'.join(parts).encode()).hexdigest()[:16]}"
-
-
-def load_human(path: Path) -> List[Dict]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def word_count(text: str) -> int:
@@ -268,8 +264,7 @@ class Ledger:
         self.attempted = set()
         self.spent = 0.0
         if path.exists():
-            for line in path.read_text().splitlines():
-                entry = json.loads(line)
+            for entry in read_jsonl(path):
                 self.spent += entry.get("cost", 0.0)
                 # A provider failure can be tried again; a reply that was rejected was paid for.
                 if entry["status"] != "error":
@@ -279,8 +274,7 @@ class Ledger:
         self.spent += entry.get("cost", 0.0)
         if entry["status"] != "error":
             self.attempted.add(entry["id"])
-        with self.path.open("a") as handle:
-            handle.write(json.dumps(entry) + "\n")
+        append_jsonl(self.path, [entry])
 
 
 def row_for(task: Task, text: str) -> Dict:
@@ -351,8 +345,7 @@ def run(
             in_flight["reserved"] -= worst
             errors_in_a_row[task.model] = 0
             if reason is None:
-                with output.open("a") as handle:
-                    handle.write(json.dumps(row_for(task, reply["text"]), ensure_ascii=False) + "\n")
+                append_jsonl(output, [row_for(task, reply["text"])])
                 ledger.write({**entry, "status": "ok", "cost": reply["cost"], "words": word_count(reply["text"])})
                 statuses["ok"] += 1
             else:
@@ -417,7 +410,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Not in OpenRouter's catalogue any more: {', '.join(missing)}. Choose others with --models / --heldout-models.")
         return 1
 
-    tasks = build_tasks(load_human(human), args.count, args.seed, training, heldout, args.polish_count)
+    tasks = build_tasks(read_jsonl(human), args.count, args.seed, training, heldout, args.polish_count)
     summary = dry_run_summary(tasks, pricing)
     print(json.dumps(summary, indent=2))
     if args.dry_run:

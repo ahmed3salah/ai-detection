@@ -310,7 +310,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     report = evaluate(args.artifacts, args.data, latency=args.latency)
     out = Path(args.out or Path(args.artifacts) / "evaluation.json")
-    out.write_text(json.dumps(report, indent=2))
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print("\n".join(summary_lines(report)))
     print(f"\nFull report: {out}")
     return 0 if report["ready_to_ship"] else 1
