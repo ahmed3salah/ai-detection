@@ -218,9 +218,21 @@ def build_tasks(rows: Sequence[Dict], count: int, seed: int, training_models: Se
         model = choose_model(row, seed, training_models, heldout_models)
         tasks.append(Task(task_id("ai", row["id"], model, mode, PROMPT_VERSION), model, mode, prompt, words, row))
 
-    # Polished human text is measured, never trained on. These don't overlap the replaced paragraphs.
+    # Polished human text is measured, never trained on, so its paper is kept out of training too.
+    # Taken only from papers already in the test split: elsewhere, the pilot's polishing pulled 57
+    # papers out of training. These don't overlap the replaced paragraphs.
     used = {row["id"] for row in targets}
-    spare = sorted((row for row in rows if row["id"] not in used and row["section"] != "abstract" and 40 <= word_count(row["text"]) <= 300), key=lambda row: row["id"])
+    spare = sorted(
+        (
+            row
+            for row in rows
+            if row["id"] not in used
+            and row["section"] != "abstract"
+            and 40 <= word_count(row["text"]) <= 300
+            and assign_paper(row["paper_id"], seed) == TEST
+        ),
+        key=lambda row: row["id"],
+    )
     random.Random(seed + 1).shuffle(spare)
     for row in spare[:polish_count]:
         model = training_models[int(stable_fraction("polish", seed, row["id"]) * len(training_models))]

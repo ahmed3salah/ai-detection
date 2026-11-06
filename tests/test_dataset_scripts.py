@@ -214,6 +214,11 @@ class TaskBuildingTest(unittest.TestCase):
     def test_tasks_are_stable_between_runs(self):
         self.assertEqual([t.id for t in tasks(50)], [t.id for t in tasks(50)])
 
+    def test_polished_paragraphs_come_only_from_test_papers(self):
+        polished = [t for t in tasks(40, polish=30) if t.mode == "polish"]
+        self.assertTrue(polished)
+        self.assertEqual({gen.assign_paper(t.source["paper_id"], 42) for t in polished}, {gen.TEST})
+
     def test_polished_tasks_show_the_paragraph_and_avoid_replaced_ones(self):
         all_tasks = tasks(40, polish=10)
         polished = [t for t in all_tasks if t.mode == "polish"]
@@ -457,7 +462,7 @@ class MergeTest(unittest.TestCase):
         self.assertNotIn("title", merged[0])
 
     def test_uses_one_generation_round_and_keeps_polished_rows(self):
-        rows = human_rows(papers=5, per_paper=3)
+        rows = human_rows(papers=30, per_paper=3)
         made = gen.build_tasks(rows, 4, 42, TRAINING, [], 1)
         ai = [gen.row_for(t, "Text here.") for t in made]
         old = {**ai[0], "id": "old-1", "prompt_version": "v1"}
@@ -488,14 +493,14 @@ class MergeTest(unittest.TestCase):
         self.assertFalse(merge.is_fragment('He called it "noise."'))
 
     def test_keeps_one_polished_version_per_source(self):
-        rows = human_rows(papers=5, per_paper=3)
+        rows = human_rows(papers=30, per_paper=3)
         task = gen.build_tasks(rows, 0, 42, TRAINING, [], 1)[0]
         first, second = gen.row_for(task, "Edited."), {**gen.row_for(task, "Edited again."), "id": "polish-other-model"}
         merged = merge.merge(rows, [first, second], gen.PROMPT_VERSION)
         self.assertEqual([r["id"] for r in merged], [first["id"]])
 
     def test_a_polished_row_does_not_bring_its_source_along(self):
-        rows = human_rows(papers=5, per_paper=3)
+        rows = human_rows(papers=30, per_paper=3)
         task = gen.build_tasks(rows, 0, 42, TRAINING, [], 1)[0]
         merged = merge.merge(rows, [gen.row_for(task, "Edited.")])
         self.assertEqual([r["test_set"] for r in merged], ["polished"])
@@ -503,7 +508,7 @@ class MergeTest(unittest.TestCase):
     def test_the_merged_file_loads_through_the_strict_loader(self):
         from segment_dataset import load_segments
 
-        rows = human_rows(papers=5, per_paper=3)
+        rows = human_rows(papers=30, per_paper=3)
         ai = [gen.row_for(t, "Text here.") for t in gen.build_tasks(rows, 6, 42, TRAINING, [], 2)]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "s.jsonl"

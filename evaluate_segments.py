@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL", ca
 import argparse
 import json
 import math
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -44,6 +45,7 @@ MIN_GENERATOR_PARAGRAPHS = 100
 MIN_DOCUMENTS = 50
 MIN_BUCKET_PARAGRAPHS = 30
 MAX_FEATURE_FAILURE_RATE = 0.001
+MAX_SHORTCUT_DROP = 0.05
 
 LATENCY_SEGMENTS = 25
 LATENCY_THREADS = 2
@@ -161,6 +163,7 @@ def evaluate_gates(
     non_native: Dict[str, Any],
     feature_failure_rate: float,
     latency_seconds: Optional[float],
+    shortcut: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Each ship gate's status, limit and measurement. Needs enough data to count as measured."""
     gates: Dict[str, Dict[str, Any]] = {
@@ -195,12 +198,45 @@ def evaluate_gates(
         "status": PASS if feature_failure_rate <= MAX_FEATURE_FAILURE_RATE else FAIL,
     }
 
+    drop = (shortcut or {}).get("drop")
+    gates["no_parens_digits_shortcut"] = {
+        "limit": f"AUROC drops <= {MAX_SHORTCUT_DROP} with parentheses and digits removed",
+        "measured": shortcut or {},
+        "status": NOT_MEASURED if drop is None or human_test["n"] < MIN_PARAGRAPHS else (PASS if drop <= MAX_SHORTCUT_DROP else FAIL),
+    }
+
     gates["cpu_latency"] = {
         "limit": f"< {LATENCY_LIMIT_SECONDS:.0f} s for {LATENCY_SEGMENTS} paragraphs on {LATENCY_THREADS} threads",
         "measured": {"seconds": latency_seconds},
         "status": NOT_MEASURED if latency_seconds is None else (PASS if latency_seconds < LATENCY_LIMIT_SECONDS else FAIL),
     }
     return gates
+
+
+_PARENS_AND_DIGITS = re.compile(r"[()\d]")
+
+
+def strip_parens_and_digits(text: str) -> str:
+    """The text without the two traces the pilot's leak check could not remove."""
+    return " ".join(_PARENS_AND_DIGITS.sub(" ", text).split())
+
+
+def shortcut_check(model: SegmentModel, rows: Sequence[Row], likely: float) -> Dict[str, Any]:
+    """
+    Score the test set again with parentheses and digits removed. If the model was leaning on them,
+    as a shortcut rather than reading the writing, its AUROC drops; if not, it barely moves.
+    """
+    normal, stripped = Scored(model, rows), Scored(model, [{**row, "text": strip_parens_and_digits(row["text"])} for row in rows])
+    if len(set(normal.labels.tolist())) < 2 or len(set(stripped.labels.tolist())) < 2:
+        return {"auroc": None, "auroc_stripped": None, "drop": None}
+    auroc = float(roc_auc_score(normal.labels, normal.probabilities))
+    auroc_stripped = float(roc_auc_score(stripped.labels, stripped.probabilities))
+    return {
+        "auroc": round(auroc, 4),
+        "auroc_stripped": round(auroc_stripped, 4),
+        "drop": round(auroc - auroc_stripped, 4),
+        "ai_recall_stripped": rate_at(stripped.of_label(1), likely)["rate"],
+    }
 
 
 def measure_latency(model: SegmentModel, rows: Sequence[Row]) -> Optional[float]:
@@ -261,6 +297,7 @@ def evaluate(artifacts: str, data: str, *, latency: bool = False) -> Dict[str, A
         non_native=rate_at(scored["non_native"].of_label(0), likely),
         feature_failure_rate=failure_rate,
         latency_seconds=measure_latency(model, splits[TEST]) if latency else None,
+        shortcut=shortcut_check(model, splits[TEST], likely),
     )
 
     labels = test.labels
@@ -293,7 +330,7 @@ def summary_lines(report: Dict[str, Any]) -> List[str]:
     lines = [f"Model {report['model_version']}  thresholds {report['thresholds']}", ""]
     for name, gate in report["gates"].items():
         measured = gate["measured"]
-        value = measured.get("rate", measured.get("spread", measured.get("seconds")))
+        value = measured.get("rate", measured.get("spread", measured.get("seconds", measured.get("drop"))))
         n = measured.get("n")
         lines.append(f"  {gate['status'].upper():13s}{name:32s}{value!s:>8}  n={n!s:<7} limit {gate['limit']}")
     lines += ["", f"Ready to ship: {'YES' if report['ready_to_ship'] else 'NO'}"]

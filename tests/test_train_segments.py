@@ -314,6 +314,13 @@ class TrainEndToEndTest(unittest.TestCase):
         self.assertIn("methods", report["breakdowns"]["section"])
         self.assertTrue(ev.summary_lines(report)[-1].endswith("NO"))
 
+    def test_the_shortcut_check_runs_on_the_test_set(self):
+        report = ev.evaluate(str(self.artifacts), self.data)
+        measured = report["gates"]["no_parens_digits_shortcut"]["measured"]
+        self.assertIsNotNone(measured["auroc_stripped"])
+        self.assertAlmostEqual(measured["drop"], measured["auroc"] - measured["auroc_stripped"], places=3)
+        self.assertEqual(ev.strip_parens_and_digits("We ran 3 trials (n = 12) [4]."), "We ran trials n = [ ].")
+
     def test_latency_is_measured_when_asked(self):
         report = ev.evaluate(str(self.artifacts), self.data, latency=True)
         self.assertEqual(report["gates"]["cpu_latency"]["status"], ev.PASS)
@@ -329,6 +336,7 @@ class GateTest(unittest.TestCase):
         non_native={"n": 400, "rate": 0.01},
         feature_failure_rate=0.0,
         latency_seconds=5.0,
+        shortcut={"auroc": 0.95, "auroc_stripped": 0.94, "drop": 0.01},
     )
 
     def statuses(self, **changes):
@@ -351,6 +359,7 @@ class GateTest(unittest.TestCase):
             "non_native_fpr": {"non_native": {"n": 400, "rate": 0.021}},
             "feature_failures": {"feature_failure_rate": 0.01},
             "cpu_latency": {"latency_seconds": 60.0},
+            "no_parens_digits_shortcut": {"shortcut": {"auroc": 0.95, "auroc_stripped": 0.80, "drop": 0.15}},
         }
         for gate, change in cases.items():
             self.assertEqual(self.statuses(**change)[gate], ev.FAIL, gate)
@@ -368,6 +377,7 @@ class GateTest(unittest.TestCase):
             "non_native_fpr": {"non_native": {"n": 40, "rate": 0.0}},
             "ai_recall_length_spread": {"bucket_recalls": {"40-80": {"n": 100, "rate": 0.9}}},
             "cpu_latency": {"latency_seconds": None},
+            "no_parens_digits_shortcut": {"shortcut": None},
         }
         for gate, change in cases.items():
             self.assertEqual(self.statuses(**change)[gate], ev.NOT_MEASURED, gate)
