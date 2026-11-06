@@ -573,6 +573,34 @@ class WholeDocumentTest(unittest.TestCase):
             self.assertFalse(test_only & {r["paper_id"] for r in splits[name]})
 
 
+render = load_script("render_check")
+
+
+class RenderCheckTest(unittest.TestCase):
+    def test_the_page_escapes_text_and_keeps_headings_in_order(self):
+        page = render.document_html("A <b> title", [{"heading": "1 Intro", "paragraphs": ["x < y & z", "second"]}, {"heading": None, "paragraphs": ["third"]}])
+        self.assertIn("<h1>A &lt;b&gt; title</h1>", page)
+        self.assertIn("<p>x &lt; y &amp; z</p>", page)
+        self.assertLess(page.index("1 Intro"), page.index("third"))
+        self.assertIn('charset="utf-8"', page)
+
+    def test_sections_group_consecutive_paragraphs_under_one_heading(self):
+        rows = [{"heading": "A", "text": "1"}, {"heading": "A", "text": "2"}, {"heading": "B", "text": "3"}]
+        self.assertEqual(render.sections_of(rows), [{"heading": "A", "paragraphs": ["1", "2"]}, {"heading": "B", "paragraphs": ["3"]}])
+
+    def test_pairs_each_test_papers_ai_rows_with_the_human_rows_they_replaced(self):
+        rows = human_rows(papers=40, per_paper=4)
+        made = gen.build_tasks(rows, 40, 42, TRAINING, HELDOUT)
+        generated = [gen.row_for(t, "Text here.") for t in made]
+        merged = merge.merge(rows, generated, gen.PROMPT_VERSION)
+        papers = render.paired_documents(merged, generated, rows, 42, HELDOUT)
+        self.assertTrue(papers)
+        for paper_id, sides in papers.items():
+            self.assertEqual(gen.assign_paper(paper_id, 42), gen.TEST)
+            self.assertEqual(len(sides["human"]), len(sides["ai"]))
+            self.assertEqual([r["position"] for r in sides["ai"]], sorted(r["position"] for r in sides["ai"]))
+
+
 class LeakCheckTest(unittest.TestCase):
     @staticmethod
     def rows(ai_text, human_text):
