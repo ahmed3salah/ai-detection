@@ -492,18 +492,25 @@ class MergeTest(unittest.TestCase):
         self.assertFalse(merge.is_fragment("We placed the sensors along the path (Fig. 1)."))
         self.assertFalse(merge.is_fragment('He called it "noise."'))
 
+    def test_drops_polished_rows_from_papers_outside_the_test_split(self):
+        rows = human_rows(papers=30, per_paper=3)
+        outside = next(r for r in rows if gen.assign_paper(r["paper_id"], 42) != gen.TEST and r["section"] != "abstract")
+        polished = {"id": "polish-x", "text": "Edited.", "label": 0, "paper_id": outside["paper_id"], "domain": "cs", "section": "methods", "generator": "g", "mode": "polish", "source_segment_id": outside["id"], "test_set": "polished"}
+        self.assertNotIn("polish-x", {r["id"] for r in merge.merge(rows, [polished], gen.PROMPT_VERSION)})
+
     def test_keeps_one_polished_version_per_source(self):
         rows = human_rows(papers=30, per_paper=3)
         task = gen.build_tasks(rows, 0, 42, TRAINING, [], 1)[0]
         first, second = gen.row_for(task, "Edited."), {**gen.row_for(task, "Edited again."), "id": "polish-other-model"}
         merged = merge.merge(rows, [first, second], gen.PROMPT_VERSION)
-        self.assertEqual([r["id"] for r in merged], [first["id"]])
+        self.assertEqual([r["id"] for r in merged if r.get("test_set") == "polished"], [first["id"]])
 
     def test_a_polished_row_does_not_bring_its_source_along(self):
         rows = human_rows(papers=30, per_paper=3)
         task = gen.build_tasks(rows, 0, 42, TRAINING, [], 1)[0]
         merged = merge.merge(rows, [gen.row_for(task, "Edited.")])
-        self.assertEqual([r["test_set"] for r in merged], ["polished"])
+        self.assertEqual([r["test_set"] for r in merged if r["test_set"] not in ("e2e", "non_native")], ["polished"])
+        self.assertNotIn(task.source["id"], {r["id"] for r in merged if r.get("test_set") != "polished"})
 
     def test_the_merged_file_loads_through_the_strict_loader(self):
         from segment_dataset import load_segments
@@ -512,9 +519,58 @@ class MergeTest(unittest.TestCase):
         ai = [gen.row_for(t, "Text here.") for t in gen.build_tasks(rows, 6, 42, TRAINING, [], 2)]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "s.jsonl"
-            path.write_text("".join(json.dumps(r) + "\n" for r in merge.merge(rows, ai)))
+            merged = merge.merge(rows, ai)
+            path.write_text("".join(json.dumps(r) + "\n" for r in merged), encoding="utf-8")
             loaded, _ = load_segments(path)
-        self.assertEqual(len(loaded), 14)
+        self.assertEqual(len(loaded), len(merged))
+        self.assertEqual(sum(r.get("test_set") is None for r in loaded), 12)
+
+
+tagger = load_script("tag_non_native")
+
+
+class NonNativeTest(unittest.TestCase):
+    def test_a_paper_is_non_native_only_when_every_known_author_is(self):
+        self.assertTrue(tagger.classify([["SG"], ["CN"], []]))
+        self.assertFalse(tagger.classify([["US"], ["GB", "US"]]))
+        self.assertIsNone(tagger.classify([["US"], ["CN"]]))
+        self.assertIsNone(tagger.classify([["CN", "US"]]))
+        self.assertIsNone(tagger.classify([[], []]))
+
+    def test_openalex_keys(self):
+        self.assertEqual(tagger.openalex_key("arxiv:1704.01397"), "doi:10.48550/arXiv.1704.01397")
+        self.assertEqual(tagger.openalex_key("pmc:5478946"), "pmcid:PMC5478946")
+        self.assertIsNone(tagger.openalex_key("other:1"))
+
+    def test_reads_countries_per_author(self):
+        work = {"authorships": [{"countries": ["SG", "SG"]}, {"countries": []}, {}]}
+        self.assertEqual(tagger.author_countries(work), [["SG"], [], []])
+
+
+class WholeDocumentTest(unittest.TestCase):
+    def test_test_papers_other_paragraphs_become_test_only_rows(self):
+        rows = human_rows(papers=40, per_paper=4)
+        made = gen.build_tasks(rows, 20, 42, TRAINING, [])
+        test_papers = sorted({r["paper_id"] for r in rows if gen.assign_paper(r["paper_id"], 42) == gen.TEST})
+        merged = merge.merge(rows, [gen.row_for(t, "Text here.") for t in made], gen.PROMPT_VERSION, 42, {test_papers[0]})
+        extra = [r for r in merged if r.get("test_set") in ("e2e", "non_native")]
+        self.assertTrue(extra)
+        self.assertEqual({gen.assign_paper(r["paper_id"], 42) for r in extra}, {gen.TEST})
+        self.assertEqual({r["test_set"] for r in extra if r["paper_id"] == test_papers[0]}, {"non_native"})
+        self.assertNotIn("non_native", {r["test_set"] for r in extra if r["paper_id"] != test_papers[0]})
+        self.assertFalse({r["id"] for r in extra} & {t.source["id"] for t in made})
+        self.assertTrue(all(r["label"] == 0 for r in extra))
+
+    def test_no_test_only_row_reaches_training(self):
+        from segment_dataset import split_segments
+
+        rows = human_rows(papers=40, per_paper=4)
+        made = gen.build_tasks(rows, 20, 42, TRAINING, [], 3)
+        merged = merge.merge(rows, [gen.row_for(t, "Text here.") for t in made], gen.PROMPT_VERSION, 42, set())
+        splits = split_segments(merged, 42)
+        test_only = {r["paper_id"] for r in merged if r.get("test_set")}
+        for name in ("train", "calibration"):
+            self.assertFalse(test_only & {r["paper_id"] for r in splits[name]})
 
 
 class LeakCheckTest(unittest.TestCase):

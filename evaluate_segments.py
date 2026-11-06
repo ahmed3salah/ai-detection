@@ -291,9 +291,13 @@ def evaluate(artifacts: str, data: str, *, latency: bool = False) -> Dict[str, A
 
     human_test = rate_at(test.of_label(0), likely)
     e2e = scored["e2e"]
+    # Each test paper's whole human text: the paired paragraphs plus the rest of the paper.
+    whole = [test, e2e, scored["non_native"]]
+    document_rows = [row for part in whole for row in part.rows_of_label(0)]
+    document_probabilities = np.concatenate([part.of_label(0) for part in whole]) if document_rows else np.zeros(0)
     gates = evaluate_gates(
         human_test=human_test,
-        document=document_flag_rate(e2e.rows_of_label(0), e2e.of_label(0), likely),
+        document=document_flag_rate(document_rows, document_probabilities, likely) if e2e.rows else {"n": 0, "rate": None, "upper_95": None},
         ai_test=rate_at(test.of_label(1), likely),
         ai_generator=rate_at(scored[HELDOUT_GENERATOR].of_label(1), likely),
         bucket_recalls=bucket_recalls,
