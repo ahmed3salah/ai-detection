@@ -143,11 +143,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for paper_id, sides in sorted(papers.items()):
         title = sides["human"][0].get("title") or "Untitled"
         for side, rows in sides.items():
-            stem = out_dir / f"{paper_id.replace(':', '_').replace('/', '_')}-{side}"
+            # Not Path.with_suffix: the dot in an arXiv id would read as the extension.
+            name = f"{paper_id.replace(':', '_').replace('/', '_')}-{side}"
+            html_path, pdf_path = out_dir / f"{name}.html", out_dir / f"{name}.pdf"
             try:
-                stem.with_suffix(".html").write_text(document_html(title, sections_of(rows)), encoding="utf-8")
-                print_pdf(edge, stem.with_suffix(".html"), stem.with_suffix(".pdf"))
-                segments = segmenter.from_tei(grobid_tei(session, args.grobid_url, stem.with_suffix(".pdf").read_bytes()))
+                html_path.write_text(document_html(title, sections_of(rows)), encoding="utf-8")
+                print_pdf(edge, html_path, pdf_path)
+                segments = segmenter.from_tei(grobid_tei(session, args.grobid_url, pdf_path.read_bytes()))
             except Exception as e:
                 results[side]["failed"] += 1
                 print(f"[render] {paper_id} {side}: {type(e).__name__}: {str(e)[:120]}")
