@@ -92,6 +92,13 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(normalize_segment(""), "")
         self.assertEqual(normalize_segment(None), "")
 
+    def test_drops_formula_remnants_but_keeps_real_parentheticals(self):
+        self.assertEqual(
+            normalize_segment("The data {(x 1 , y 1 ), (x 2 , y 2 )} ignores (x n , y n ) so the unit (IMU) and (during separate sessions) stay."),
+            "The data ignores so the unit (IMU) and (during separate sessions) stay.",
+        )
+        self.assertEqual(normalize_segment("Panel (a) shows f (x) for n = 4."), "Panel shows f for n 4.")
+
     def test_a_citation_only_paragraph_leaves_nothing(self):
         self.assertEqual(normalize_segment("[1] [2]"), "")
 
@@ -249,7 +256,7 @@ class TrainEndToEndTest(unittest.TestCase):
         config = SegmentModel(self.artifacts).config
         self.assertEqual(config["model_version"], "v-test")
         self.assertEqual(config["feature_set"], "style_v2")
-        self.assertEqual(config["text_normalization"], "v1")
+        self.assertEqual(config["text_normalization"], "v2")
         self.assertEqual(config["split_seed"], 42)
         self.assertEqual(config["dataset_sha256"], ds.load_segments(self.data)[1])
         self.assertLessEqual(config["segment_thresholds"]["possibly_ai"], config["segment_thresholds"]["likely_ai"])
@@ -401,12 +408,12 @@ class ServingNormalizationTest(unittest.TestCase):
 
     def test_a_model_trained_on_normalized_text_gets_normalized_text(self):
         self.assertEqual(
-            self.texts_seen({"text_normalization": "v1"})[0],
+            self.texts_seen({"text_normalization": "v2"})[0],
             ["Our method improves the baseline on every benchmark we report."],
         )
 
     def test_nothing_left_after_cleaning_is_unscored_not_a_row_of_zeros(self):
-        self.assertEqual(self.texts_seen({"text_normalization": "v1"}, "[1] [2] [3] [4] [5] [6]")[1], [])
+        self.assertEqual(self.texts_seen({"text_normalization": "v2"}, "[1] [2] [3] [4] [5] [6]")[1], [])
 
 
 if __name__ == "__main__":

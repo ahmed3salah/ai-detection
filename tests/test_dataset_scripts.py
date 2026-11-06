@@ -222,6 +222,56 @@ class TaskBuildingTest(unittest.TestCase):
         self.assertFalse({t.source["id"] for t in polished} & {t.source["id"] for t in all_tasks if t.mode != "polish"})
 
 
+class ContentAnchorTest(unittest.TestCase):
+    """Generated text has to carry the same kind of specifics as the human paragraph it replaces."""
+
+    TEXT = (
+        "We evaluated the approach in a laboratory of 25 m\u00d715 m, as shown in Fig. 1. Three persons carrying "
+        "UWB sensors (i.e. transmitters and receivers) walked at 1.2 m/s, and the inertial measurement unit (IMU) "
+        "drifted by 4.5% after 30 s (see Table 2). The error stayed below \u03c3 = 0.3 for 95% of runs "
+        "(a long aside that goes on well past the six word limit for a parenthetical)."
+    )
+
+    def test_pulls_out_numbers_references_short_parentheticals_and_symbols(self):
+        anchors = gen.content_anchors(self.TEXT)
+        for expected in ("25 m\u00d715 m", "Fig. 1", "(i.e. transmitters and receivers)", "1.2 m/s", "(IMU)", "4.5%", "30 s", "Table 2", "\u03c3", "0.3", "95%"):
+            self.assertIn(expected, anchors)
+        self.assertFalse(any("long aside" in anchor for anchor in anchors))
+        self.assertLessEqual(len(anchors), gen.MAX_ANCHORS)
+
+    def test_a_word_after_a_number_is_not_a_unit_and_citations_are_not_details(self):
+        anchors = gen.content_anchors("The error was 0.3 for most runs and 12 of them failed [15,16,17].")
+        self.assertEqual(anchors, ["0.3", "12"])
+
+    def test_typographic_punctuation_is_not_a_symbol(self):
+        self.assertEqual(gen.content_anchors("Ratings\u2014are high in Dulbecco\u2019s medium with \u03b1 \u2264 \u03b2."), ["\u03b1", "\u2264", "\u03b2"])
+
+    def test_keeps_document_order_and_no_duplicates(self):
+        anchors = gen.content_anchors("At 5 ms (fast) and again at 5 ms, see Fig. 2 and Fig. 2.")
+        self.assertEqual(anchors, ["5 ms", "(fast)", "Fig. 2"])
+
+    def test_prose_with_no_specifics_adds_nothing_to_the_prompt(self):
+        rules = gen.INSTRUCTIONS.format(words=100)
+        self.assertEqual(gen.with_anchors(rules, "We discuss what this means for future work on the problem."), rules)
+
+    def test_the_prompt_carries_the_details_but_not_the_sentences(self):
+        row = {"id": "p#3", "text": self.TEXT, "paper_id": "p", "section": "results", "heading": "4 Results", "title": "T", "position": 3}
+        _, prompt = gen.build_prompt(row, None, 60, 42)
+        self.assertIn("Fig. 1", prompt)
+        self.assertIn("4.5%", prompt)
+        self.assertNotIn("We evaluated the approach", prompt)
+        self.assertNotIn("drifted by", prompt)
+
+    def test_a_new_prompt_version_makes_new_tasks(self):
+        first = {t.id for t in tasks(20)}
+        original = gen.PROMPT_VERSION
+        gen.PROMPT_VERSION = "v-next"
+        try:
+            self.assertFalse(first & {t.id for t in tasks(20)})
+        finally:
+            gen.PROMPT_VERSION = original
+
+
 class RejectionTest(unittest.TestCase):
     OK = " ".join(["word"] * 99) + " end."
 
@@ -397,6 +447,20 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(sum(r["label"] == 1 for r in merged), 6)
         self.assertEqual(sum(r["label"] == 0 for r in merged), 6)
         self.assertNotIn("title", merged[0])
+
+    def test_uses_one_generation_round_and_keeps_polished_rows(self):
+        rows = human_rows(papers=5, per_paper=3)
+        made = gen.build_tasks(rows, 4, 42, TRAINING, [], 1)
+        ai = [gen.row_for(t, "Text here.") for t in made]
+        old = {**ai[0], "id": "old-1", "prompt_version": "v1"}
+        unversioned = {**ai[1], "id": "old-2"}
+        unversioned.pop("prompt_version")
+        merged = merge.merge(rows, ai + [old, unversioned], gen.PROMPT_VERSION)
+        ids = {r["id"] for r in merged}
+        self.assertNotIn("old-1", ids)
+        self.assertNotIn("old-2", ids)
+        self.assertEqual(sum(r.get("test_set") == "polished" for r in merged), 1)
+        self.assertEqual(sum(r["label"] == 1 for r in merged), 4)
 
     def test_a_polished_row_does_not_bring_its_source_along(self):
         rows = human_rows(papers=5, per_paper=3)

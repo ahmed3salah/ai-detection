@@ -22,6 +22,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -61,9 +62,28 @@ OUTLINE_SHARE = 0.3
 MAX_CONSECUTIVE_MODEL_ERRORS = 5
 
 INSTRUCTIONS = (
-    "Write about {words} words of plain academic prose as one paragraph. No heading, list, markdown, "
-    "citations or references. Do not mention these instructions. Reply with the paragraph only."
+    "Write about {words} words of academic prose as one paragraph. No heading, list or markdown, and "
+    "don't invent citations. Do not mention these instructions. Reply with the paragraph only."
 )
+
+# Part of every task id: a prompt change makes new tasks rather than skipping them as already tried.
+PROMPT_VERSION = "v2"
+
+# Concrete details pulled from the paragraph being replaced. Without them, generated text had far
+# fewer numbers and parentheses than the human text it stood in for (the pilot's leak check), and a
+# model would learn "numbers mean human". Fragments only, so no human wording carries over.
+_ANCHOR_REFERENCE = re.compile(r"\b(?:Fig(?:ure)?s?\.?|Tables?|Eqs?\.?|Equations?|Sec(?:tion)?s?\.?|Algorithm)\s*\(?\d+[a-z]?", re.I)
+# Real units only: a looser pattern took "0.3 for" as a measurement.
+_UNIT = (
+    r"(?:%|\u00b0C?|min|fps|ppm|dB|px|bps|mol|Hz|kHz|MHz|GHz|Pa|kPa|MPa|"
+    r"[kMGTmun\u00b5]?(?:m|s|g|W|V|A|J|N|B|K|L|\u03a9))(?:/[A-Za-z]+)?(?![A-Za-z])"
+)
+_NUMBER_WITH_UNIT = rf"[-+]?\d+(?:[.,]\d+)*(?:\s*{_UNIT})?"
+# 25 m\u00d715 m stays one detail, not three.
+_ANCHOR_NUMBER = re.compile(rf"(?<![\w.]){_NUMBER_WITH_UNIT}(?:\s*\u00d7\s*{_NUMBER_WITH_UNIT})*")
+_ANCHOR_PARENTHETICAL = re.compile(r"\(([^()]{1,60})\)")
+MAX_ANCHORS = 15
+MAX_PARENTHETICAL_WORDS = 6
 
 _META = re.compile(r"^\s*(here is|here's|sure|certainly|paragraph:|abstract:)|as an ai\b|\*\*|^\s*#|\n\s*[-*] ", re.I | re.M)
 
@@ -123,9 +143,49 @@ def choose_model(row: Dict, seed: int, training_models: Sequence[str], heldout_m
     return pick(training_models)
 
 
+def _has_symbol(token: str) -> bool:
+    """Greek letters and math signs, not typographic punctuation like an em dash or a curly quote."""
+    return any("\u0370" <= c <= "\u03ff" or unicodedata.category(c) in ("Sm", "So") for c in token)
+
+
+def content_anchors(text: str) -> List[str]:
+    """Numbers, references, short parentheticals and symbols in a paragraph, in order, deduplicated."""
+    found: List[Tuple[int, str]] = []
+    found += [(m.start(), m.group(0).strip()) for m in _ANCHOR_REFERENCE.finditer(text)]
+    covered = [(m.start(), m.end()) for m in _ANCHOR_REFERENCE.finditer(text)]
+    # Citation numbers like [15,16,17] are not details of the work; the normaliser drops them anyway.
+    covered += [(m.start(), m.end()) for m in re.finditer(r"\[[^\]]*\]", text)]
+    for match in _ANCHOR_PARENTHETICAL.finditer(text):
+        inner = match.group(1).strip()
+        if inner and len(inner.split()) <= MAX_PARENTHETICAL_WORDS and not _ANCHOR_REFERENCE.fullmatch(inner):
+            found.append((match.start(), f"({inner})"))
+            covered.append((match.start(), match.end()))
+    for match in _ANCHOR_NUMBER.finditer(text):
+        if not any(start <= match.start() < end for start, end in covered):
+            found.append((match.start(), match.group(0).strip()))
+            covered.append((match.start(), match.end()))
+    for match in re.finditer(r"\S*[^\x00-\x7f]\S*", text):
+        token = match.group(0).strip(".,;:")
+        if len(token) <= 12 and _has_symbol(token) and not any(start <= match.start() < end for start, end in covered):
+            found.append((match.start(), token))
+
+    anchors: List[str] = []
+    for _, anchor in sorted(found):
+        if anchor and anchor not in anchors:
+            anchors.append(anchor)
+    return anchors[:MAX_ANCHORS]
+
+
+def with_anchors(rules: str, source_text: str) -> str:
+    anchors = content_anchors(source_text)
+    if not anchors:
+        return rules
+    return f"Work in these details from the authors' notes where they fit: {'; '.join(anchors)}. {rules}"
+
+
 def build_prompt(row: Dict, previous: Optional[Dict], words: int, seed: int) -> Tuple[str, str]:
-    """The mode and prompt for replacing a paragraph. The paragraph itself is never shown."""
-    rules = INSTRUCTIONS.format(words=words)
+    """The mode and prompt for replacing a paragraph. Only its details are shown, never its wording."""
+    rules = with_anchors(INSTRUCTIONS.format(words=words), row["text"])
     title = row.get("title") or "an academic paper"
     if row["section"] == "abstract":
         return "abstract", f'Write the abstract of a research paper titled "{title}". {rules}'
@@ -150,7 +210,7 @@ def build_tasks(rows: Sequence[Dict], count: int, seed: int, training_models: Se
         previous = by_paper[row["paper_id"]].get(row.get("position", -1) - 1)
         mode, prompt = build_prompt(row, previous, words, seed)
         model = choose_model(row, seed, training_models, heldout_models)
-        tasks.append(Task(task_id("ai", row["id"], model, mode), model, mode, prompt, words, row))
+        tasks.append(Task(task_id("ai", row["id"], model, mode, PROMPT_VERSION), model, mode, prompt, words, row))
 
     # Polished human text is measured, never trained on. These don't overlap the replaced paragraphs.
     used = {row["id"] for row in targets}
@@ -289,6 +349,7 @@ def row_for(task: Task, text: str) -> Dict:
         "mode": task.mode,
         "source_segment_id": source["id"],
         "target_words": task.target_words,
+        "prompt_version": PROMPT_VERSION,
     }
     if task.mode == "polish":
         return {**row, "label": 0, "test_set": "polished"}

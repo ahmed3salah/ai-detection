@@ -11,7 +11,7 @@ when the rules change: a model has to be served with the rules it was trained on
 import re
 import unicodedata
 
-NORMALIZATION_VERSION = "v1"
+NORMALIZATION_VERSION = "v2"
 
 _HYPHEN_LINE_BREAK = re.compile(r"(?<=\w)-\s*\n\s*(?=[a-z])")
 
@@ -31,6 +31,11 @@ _AUTHOR_YEAR_CITATION = re.compile(
 # Smith et al. (2019): the name stays, it reads as prose; the year goes.
 _YEAR_IN_PARENS = re.compile(rf"\(\s*{_YEAR}(?:\s*[;,]\s*{_YEAR})*\s*\)")
 
+# What GROBID leaves where an inline formula was: (x 1 , y 1 ), (x), {(x 1, y 1), ...}.
+_BRACES = re.compile(r"\{[^{}]*\}")
+_PARENTHETICAL = re.compile(r"\(([^()]*)\)")
+_WORD = re.compile(r"[A-Za-z]{3,}")
+
 _SPACE_BEFORE_PUNCTUATION = re.compile(r"\s+([,.;:!?)\]])")
 _EMPTY_BRACKETS = re.compile(r"\(\s*\)|\[\s*\]")
 _WHITESPACE = re.compile(r"\s+")
@@ -39,6 +44,13 @@ _WHITESPACE = re.compile(r"\s+")
 def _is_math_symbol_token(token: str) -> bool:
     """A token that is only math symbols, as GROBID leaves behind where a formula was."""
     return bool(token) and all(unicodedata.category(c) in ("Sm", "So") for c in token)
+
+
+def _drop_math_parenthetical(match: "re.Match[str]") -> str:
+    """Keep "(IMU)" or "(during separate sessions)"; drop "(x 1 , y 1 )" or "(a)"."""
+    tokens = match.group(1).split()
+    words = sum(1 for token in tokens if _WORD.search(token))
+    return match.group(0) if tokens and words * 2 >= len(tokens) else " "
 
 
 def normalize_segment(text: str) -> str:
@@ -51,6 +63,8 @@ def normalize_segment(text: str) -> str:
     text = _NUMERIC_CITATION.sub(" ", text)
     text = _AUTHOR_YEAR_CITATION.sub(" ", text)
     text = _YEAR_IN_PARENS.sub(" ", text)
+    text = _BRACES.sub(" ", text)
+    text = _PARENTHETICAL.sub(_drop_math_parenthetical, text)
     text = _EMPTY_BRACKETS.sub(" ", text)
     text = " ".join(token for token in text.split() if not _is_math_symbol_token(token))
     text = _SPACE_BEFORE_PUNCTUATION.sub(r"\1", text)

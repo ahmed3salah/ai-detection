@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from segment_dataset import append_jsonl, read_jsonl  # noqa: E402
 
+PROMPT_VERSION = "v2"
+
 KEEP = ("id", "text", "label", "paper_id", "domain", "section", "generator", "test_set", "mode")
 
 
@@ -24,11 +26,17 @@ def trimmed(row: Dict) -> Dict:
     return {key: row[key] for key in KEEP if row.get(key) is not None}
 
 
-def merge(human: Sequence[Dict], ai: Sequence[Dict]) -> List[Dict]:
+def merge(human: Sequence[Dict], ai: Sequence[Dict], prompt_version: Optional[str] = None) -> List[Dict]:
+    """
+    Rows from one prompt version only: a dataset mixing versions would measure neither. Polished rows
+    don't depend on the generation prompt and are always kept.
+    """
     by_id = {row["id"]: row for row in human}
     rows: List[Dict] = []
     used = set()
     for row in ai:
+        if prompt_version and not row.get("test_set") and row.get("prompt_version", "v1") != prompt_version:
+            continue
         rows.append(trimmed(row))
         source = row["source_segment_id"]
         # A polished row stands in for its source: keeping both in one test set adds nothing.
@@ -67,10 +75,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workdir", default="dataset/segments")
     parser.add_argument("--out", help="Default: <workdir>/segments.jsonl")
+    parser.add_argument("--prompt-version", default=PROMPT_VERSION, help="Which generation round to use")
     args = parser.parse_args(argv)
 
     workdir = Path(args.workdir)
-    rows = merge(read_jsonl(workdir / "human_segments.jsonl"), read_jsonl(workdir / "ai_segments.jsonl"))
+    rows = merge(read_jsonl(workdir / "human_segments.jsonl"), read_jsonl(workdir / "ai_segments.jsonl"), args.prompt_version)
     out = Path(args.out or workdir / "segments.jsonl")
     out.unlink(missing_ok=True)
     append_jsonl(out, rows)
