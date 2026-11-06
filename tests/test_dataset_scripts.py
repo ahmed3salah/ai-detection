@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -480,6 +481,61 @@ class EncodingTest(unittest.TestCase):
         page = arxiv_page([("2001.00001", "2020-01-01", BY, "cs.LG")]).replace("Paper 2001.00001", "\u03b1-stable caf\u00e9")
         candidates, _, _ = human.parse_arxiv_records(('<?xml version="1.0" encoding="UTF-8"?>' + page).encode("utf-8"))
         self.assertEqual(candidates[0].title, "\u03b1-stable caf\u00e9")
+
+
+class TeiCacheTest(unittest.TestCase):
+    """A crashed run once left half-written TEI that later runs read as papers with no paragraphs."""
+
+    TEI = '<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body><div><head>Intro</head><p>' + "We show the method works on every data set we tried here. " * 6 + "</p></div></body></text></TEI>"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "paper.tei.xml"
+        self.pdf = Path(directory.name) / "paper.pdf"
+        self.pdf.write_bytes(b"%PDF-1.4")
+        self.calls = 0
+        original = human.grobid_tei
+
+        def fake(session, url, pdf):
+            self.calls += 1
+            return self.TEI
+
+        human.grobid_tei = fake
+        self.addCleanup(setattr, human, "grobid_tei", original)
+
+    def segments(self):
+        candidate = human.Candidate("arxiv:1", "cs", "t", BY, "2020", "u", arxiv_id="1")
+        return human.process_arxiv(candidate, self.pdf, self.path, "http://grobid", None)
+
+    def test_a_truncated_cache_file_is_fetched_again(self):
+        self.path.write_text(self.TEI[: len(self.TEI) // 2], encoding="utf-8")
+        self.assertEqual(len(self.segments()), 1)
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), self.TEI)
+
+    def test_a_cache_file_in_another_encoding_is_fetched_again(self):
+        self.path.write_bytes(self.TEI.replace("method", "m\u00e9thod").encode("cp1252"))
+        self.assertEqual(len(self.segments()), 1)
+        self.assertEqual(self.calls, 1)
+
+    def test_a_good_cache_file_is_used_without_asking_grobid(self):
+        self.path.write_text(self.TEI, encoding="utf-8")
+        self.segments()
+        self.assertEqual(self.calls, 0)
+
+    def test_tei_that_does_not_parse_is_a_failure_and_is_not_cached(self):
+        human.grobid_tei = lambda session, url, pdf: "<TEI><unclosed>"
+        with self.assertRaisesRegex(RuntimeError, "could not be parsed"):
+            self.segments()
+        self.assertFalse(self.path.exists())
+
+    def test_a_crash_while_writing_leaves_no_file_behind(self):
+        target = self.path
+        with unittest.mock.patch.object(Path, "write_text", side_effect=UnicodeEncodeError("cp1252", "x", 0, 1, "boom")):
+            with self.assertRaises(UnicodeEncodeError):
+                human.write_atomically(target, self.TEI)
+        self.assertFalse(target.exists())
 
 
 class GrobidCheckTest(unittest.TestCase):

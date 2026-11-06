@@ -352,10 +352,46 @@ def quotas(total: int, weights: Dict[str, float]) -> Dict[str, int]:
     return counts
 
 
+def is_parseable_xml(text: str) -> bool:
+    try:
+        ET.fromstring(text)
+    except ET.ParseError:
+        return False
+    return True
+
+
+def cached_tei(path: Path) -> Optional[str]:
+    """
+    A cached TEI file, or None when there is none or it can't be used. A file a crashed run left
+    half-written, or saved in another encoding, is deleted so GROBID is asked again.
+    """
+    if not path.exists():
+        return None
+    try:
+        tei = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        tei = ""
+    if is_parseable_xml(tei):
+        return tei
+    path.unlink()
+    return None
+
+
+def write_atomically(path: Path, text: str) -> None:
+    """Whole or not at all: a crash midway never leaves a truncated file to be read as the real one."""
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(text, encoding="utf-8")
+    os.replace(partial, path)
+
+
 def process_arxiv(candidate: Candidate, pdf_path: Path, tei_path: Path, grobid_url: str, session: requests.Session) -> List[segmenter.Segment]:
-    if not tei_path.exists():
-        tei_path.write_text(grobid_tei(session, grobid_url, pdf_path.read_bytes()), encoding="utf-8")
-    return segmenter.from_tei(tei_path.read_text(encoding="utf-8"))
+    tei = cached_tei(tei_path)
+    if tei is None:
+        tei = grobid_tei(session, grobid_url, pdf_path.read_bytes())
+        if not is_parseable_xml(tei):
+            raise RuntimeError("GROBID's TEI could not be parsed.")
+        write_atomically(tei_path, tei)
+    return segmenter.from_tei(tei)
 
 
 def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
@@ -419,8 +455,13 @@ def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
                 pdf_path = workdir / "cache" / "pdf" / f"{candidate.arxiv_id.replace('/', '_')}.pdf"
                 tei_path = workdir / "cache" / "tei" / f"{candidate.arxiv_id.replace('/', '_')}.tei.xml"
                 try:
-                    if not pdf_path.exists() and not tei_path.exists():
-                        pdf_path.write_bytes(fetcher.get(ARXIV_PDF.format(id=candidate.arxiv_id), timeout=180).content)
+                    if not pdf_path.exists():
+                        pdf = fetcher.get(ARXIV_PDF.format(id=candidate.arxiv_id), timeout=180).content
+                        if not pdf.startswith(b"%PDF"):
+                            raise RuntimeError("arXiv did not send a PDF.")
+                        partial = pdf_path.with_name(pdf_path.name + ".partial")
+                        partial.write_bytes(pdf)
+                        os.replace(partial, pdf_path)
                 except Exception as e:
                     record(candidate, domain, None, f"{type(e).__name__}: {e}")
                     continue
