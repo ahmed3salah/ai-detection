@@ -19,6 +19,9 @@ from segment_dataset import append_jsonl, read_jsonl  # noqa: E402
 
 PROMPT_VERSION = "v2"
 
+# The sentence ends generate_ai_paragraphs.rejection_reason accepts.
+SENTENCE_ENDS = (".", "!", "?", '"', ")")
+
 KEEP = ("id", "text", "label", "paper_id", "domain", "section", "generator", "test_set", "mode")
 
 
@@ -26,16 +29,35 @@ def trimmed(row: Dict) -> Dict:
     return {key: row[key] for key in KEEP if row.get(key) is not None}
 
 
+def is_fragment(text: str) -> bool:
+    """
+    A paragraph GROBID cut at a page or column break: it starts mid-sentence or stops mid-sentence.
+    Generated paragraphs never do (replies that don't end a sentence are rejected), so keeping these
+    would teach a detector that a broken sentence means human.
+    """
+    text = text.strip()
+    return not text or text[0].islower() or not text.endswith(SENTENCE_ENDS)
+
+
 def merge(human: Sequence[Dict], ai: Sequence[Dict], prompt_version: Optional[str] = None) -> List[Dict]:
     """
     Rows from one prompt version only: a dataset mixing versions would measure neither. Polished rows
-    don't depend on the generation prompt and are always kept.
+    don't depend on the generation prompt and are always kept, one per source paragraph. A pair whose
+    human paragraph is a fragment is left out on both sides.
     """
     by_id = {row["id"]: row for row in human}
     rows: List[Dict] = []
     used = set()
+    polished_sources = set()
     for row in ai:
-        if prompt_version and not row.get("test_set") and row.get("prompt_version", "v1") != prompt_version:
+        source = by_id[row["source_segment_id"]]
+        if row.get("test_set"):
+            if row["source_segment_id"] in polished_sources:
+                continue
+            polished_sources.add(row["source_segment_id"])
+        elif prompt_version and row.get("prompt_version", "v1") != prompt_version:
+            continue
+        elif is_fragment(source["text"]):
             continue
         rows.append(trimmed(row))
         source = row["source_segment_id"]

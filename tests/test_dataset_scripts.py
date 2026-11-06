@@ -156,7 +156,7 @@ def human_rows(papers=60, per_paper=8):
         for k in range(per_paper):
             words = rng.choice([50, 100, 150, 250])
             rows.append({
-                "id": f"arxiv:{p}#{k}", "text": " ".join(["word"] * words), "label": 0, "paper_id": f"arxiv:{p}", "domain": "cs",
+                "id": f"arxiv:{p}#{k}", "text": "Word " + " ".join(["word"] * (words - 1)) + ".", "label": 0, "paper_id": f"arxiv:{p}", "domain": "cs",
                 "section": "methods" if k else "abstract", "heading": "3 Method", "position": k, "title": f"Paper {p}",
             })
     return rows
@@ -381,7 +381,7 @@ class BudgetAndResumeTest(unittest.TestCase):
     def test_the_ledger_holds_no_manuscript_text(self):
         todo = tasks(3)
         self.run_tasks(todo, good_reply)
-        self.assertNotIn("word word", self.ledger_path.read_text())
+        self.assertNotIn("word word", self.ledger_path.read_text(encoding="utf-8"))
 
     def test_dry_run_estimates_without_calling_anything(self):
         summary = gen.dry_run_summary(tasks(20), PRICING)
@@ -469,6 +469,30 @@ class MergeTest(unittest.TestCase):
         self.assertNotIn("old-2", ids)
         self.assertEqual(sum(r.get("test_set") == "polished" for r in merged), 1)
         self.assertEqual(sum(r["label"] == 1 for r in merged), 4)
+
+    def test_leaves_out_pairs_whose_human_paragraph_is_a_pdf_fragment(self):
+        rows = human_rows(papers=5, per_paper=3)
+        made = gen.build_tasks(rows, 6, 42, TRAINING, [])
+        by_id = {row["id"]: row for row in rows}
+        broken = [made[0].source["id"], made[1].source["id"]]
+        by_id[broken[0]]["text"] = by_id[broken[0]]["text"] + " and the results"
+        by_id[broken[1]]["text"] = "and then " + by_id[broken[1]]["text"]
+        merged = merge.merge(list(by_id.values()), [gen.row_for(t, "Text here.") for t in made], gen.PROMPT_VERSION)
+        self.assertEqual(sum(r["label"] == 1 for r in merged), 4)
+        self.assertFalse({r["id"] for r in merged} & set(broken))
+
+    def test_fragment_detection(self):
+        self.assertTrue(merge.is_fragment("the sensors were placed along the path and"))
+        self.assertTrue(merge.is_fragment("We placed the sensors along the path and"))
+        self.assertFalse(merge.is_fragment("We placed the sensors along the path (Fig. 1)."))
+        self.assertFalse(merge.is_fragment('He called it "noise."'))
+
+    def test_keeps_one_polished_version_per_source(self):
+        rows = human_rows(papers=5, per_paper=3)
+        task = gen.build_tasks(rows, 0, 42, TRAINING, [], 1)[0]
+        first, second = gen.row_for(task, "Edited."), {**gen.row_for(task, "Edited again."), "id": "polish-other-model"}
+        merged = merge.merge(rows, [first, second], gen.PROMPT_VERSION)
+        self.assertEqual([r["id"] for r in merged], [first["id"]])
 
     def test_a_polished_row_does_not_bring_its_source_along(self):
         rows = human_rows(papers=5, per_paper=3)
