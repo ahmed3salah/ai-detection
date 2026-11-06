@@ -413,8 +413,8 @@ class OpenRouterCallTest(unittest.TestCase):
         return Session()
 
     def setUp(self):
-        gen._MODELS_THAT_REFUSE_REASONING_SETTING.clear()
-        self.addCleanup(gen._MODELS_THAT_REFUSE_REASONING_SETTING.clear)
+        gen._REASONING_SETTING_FOR.clear()
+        self.addCleanup(gen._REASONING_SETTING_FOR.clear)
         self.task = tasks(1)[0]
 
     def test_asks_for_no_reasoning_and_reads_the_cost(self):
@@ -422,14 +422,22 @@ class OpenRouterCallTest(unittest.TestCase):
         self.assertEqual(reply, {"text": "Text.", "finish_reason": "stop", "cost": 0.002})
         self.assertEqual(self.bodies[0]["reasoning"], {"enabled": False})
 
-    def test_a_model_that_refuses_the_setting_goes_without_it_from_then_on(self):
-        session = self.session(self.Answer(400), self.Answer(200, self.OK), self.Answer(200, self.OK))
+    def test_a_model_that_refuses_a_setting_steps_down_to_the_next_and_stays_there(self):
+        session = self.session(self.Answer(400), self.Answer(400), self.Answer(200, self.OK), self.Answer(200, self.OK))
         gen.openrouter_completion(session, "key", self.task, PRICING)
         gen.openrouter_completion(session, "key", self.task, PRICING)
-        self.assertEqual(["reasoning" in body for body in self.bodies], [True, False, False])
+        self.assertEqual(
+            [body.get("reasoning") for body in self.bodies],
+            [{"enabled": False}, {"effort": "minimal"}, {"effort": "low"}, {"effort": "low"}],
+        )
 
-    def test_a_400_without_the_setting_is_a_real_error(self):
-        session = self.session(self.Answer(400), self.Answer(400))
+    def test_goes_without_a_setting_only_after_every_one_is_refused(self):
+        session = self.session(*[self.Answer(400)] * 3, self.Answer(200, self.OK))
+        gen.openrouter_completion(session, "key", self.task, PRICING)
+        self.assertNotIn("reasoning", self.bodies[-1])
+
+    def test_a_400_without_any_setting_is_a_real_error(self):
+        session = self.session(*[self.Answer(400)] * 4)
         with self.assertRaisesRegex(RuntimeError, "HTTP 400"):
             gen.openrouter_completion(session, "key", self.task, PRICING)
 

@@ -38,24 +38,30 @@ from segment_dataset import TEST, append_jsonl, assign_paper, read_jsonl  # noqa
 OPENROUTER_CHAT = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
 
-# Across vendors, from frontier to cheap. Checked against OpenRouter's catalogue on each run.
+# What people write with as of November 2026: each major vendor's current flagship and fast model,
+# chosen by release date in OpenRouter's catalogue (it publishes no usage figures). Each was checked
+# with real calls: mistral-large-4-0 and qwen3.8-max replied empty, and grok-4.7 works but its
+# reasoning costs about 20x the others, so it is left for the full run. Checked against the
+# catalogue on every run.
 TRAINING_MODELS = [
-    "openai/gpt-5.4-mini",
-    "openai/gpt-4o-mini",
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6.1-terra",
+    "openai/gpt-6-luna-pro",
     "anthropic/claude-sonnet-5.5",
     "anthropic/claude-haiku-5.5",
-    "google/gemini-2.5-flash",
-    "google/gemini-3.1-flash-lite",
-    "meta-llama/llama-4-maverick",
-    "deepseek/deepseek-v4-flash",
+    "google/gemini-4-argon",
+    "google/gemini-3.8-flash",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "qwen/qwen3.8-flash",
 ]
 # Whole vendors the model never trains on, to measure how it copes with a generator it hasn't seen.
-HELDOUT_MODELS = ["mistralai/mistral-large-2512", "qwen/qwen3-235b-a22b-2507"]
+HELDOUT_MODELS = ["moonshotai/kimi-k3.1-pro", "z-ai/glm-5.3"]
 
 LENGTH_BUCKETS = ((40, 80), (80, 120), (120, 180), (180, 300))
 WORD_TOLERANCE = 0.3
 TOKENS_PER_WORD = 1.5
 MAX_TOKENS_FACTOR = 3
+REASONING_TOKEN_ALLOWANCE = 1024
 CHARS_PER_TOKEN = 4
 HELDOUT_SHARE_OF_TEST_PAPERS = 0.5
 OUTLINE_SHARE = 0.3
@@ -255,7 +261,7 @@ def fetch_pricing(session: Optional[requests.Session] = None) -> Dict[str, Tuple
 
 def max_tokens_for(task: Task) -> int:
     """Roomy: on a reasoning model thinking counts against this, and a reply cut short is paid for."""
-    return int(task.target_words * TOKENS_PER_WORD * MAX_TOKENS_FACTOR) + 256
+    return int(task.target_words * TOKENS_PER_WORD * MAX_TOKENS_FACTOR) + REASONING_TOKEN_ALLOWANCE
 
 
 def worst_case_cost(task: Task, pricing: Dict[str, Tuple[float, float]]) -> float:
@@ -268,7 +274,10 @@ def estimated_cost(task: Task, pricing: Dict[str, Tuple[float, float]]) -> float
     return len(task.prompt) / CHARS_PER_TOKEN * per_in + task.target_words * TOKENS_PER_WORD * per_out
 
 
-_MODELS_THAT_REFUSE_REASONING_SETTING = set()
+# Least reasoning first. A model that refuses one (HTTP 400) moves on to the next, and stays there.
+# Without a setting, current models think at length, paid for, and often never get to the answer.
+REASONING_SETTINGS = ({"enabled": False}, {"effort": "minimal"}, {"effort": "low"}, None)
+_REASONING_SETTING_FOR: Dict[str, int] = {}
 
 
 def openrouter_completion(session: requests.Session, api_key: str, task: Task, pricing: Dict[str, Tuple[float, float]]) -> Dict:
@@ -280,10 +289,15 @@ def openrouter_completion(session: requests.Session, api_key: str, task: Task, p
         "temperature": 0.7,
         "usage": {"include": True},
     }
-    # A paragraph needs no reasoning. Most models take this; a few answer 400 and go without it.
-    if task.model not in _MODELS_THAT_REFUSE_REASONING_SETTING:
-        body["reasoning"] = {"enabled": False}
-    for attempt in range(4):
+    def apply_reasoning_setting() -> None:
+        setting = REASONING_SETTINGS[_REASONING_SETTING_FOR.get(task.model, 0)]
+        if setting is None:
+            body.pop("reasoning", None)
+        else:
+            body["reasoning"] = setting
+
+    apply_reasoning_setting()
+    for attempt in range(4 + len(REASONING_SETTINGS)):
         try:
             response = session.post(OPENROUTER_CHAT, json=body, headers={"Authorization": f"Bearer {api_key}"}, timeout=180)
         except requests.RequestException as e:
@@ -291,12 +305,12 @@ def openrouter_completion(session: requests.Session, api_key: str, task: Task, p
                 raise RuntimeError(type(e).__name__) from None
             time.sleep(5 * (attempt + 1))
             continue
-        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3 + len(REASONING_SETTINGS):
             time.sleep(10 * (attempt + 1))
             continue
         if response.status_code == 400 and "reasoning" in body:
-            _MODELS_THAT_REFUSE_REASONING_SETTING.add(task.model)
-            del body["reasoning"]
+            _REASONING_SETTING_FOR[task.model] = _REASONING_SETTING_FOR.get(task.model, 0) + 1
+            apply_reasoning_setting()
             continue
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code}")
