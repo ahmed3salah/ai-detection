@@ -243,6 +243,9 @@ def measure_latency(model: SegmentModel, rows: Sequence[Row]) -> Optional[float]
     """Seconds for one full batch on two CPU threads. Run it on the serving hardware to trust it."""
     import torch
 
+    if model.is_transformer and model.device.type != "cpu":
+        # Production scores on CPU: time a CPU copy, not the GPU the evaluation ran on.
+        model = SegmentModel(model.directory, device="cpu")
     texts = [row["text"] for row in rows if word_count(row["text"]) >= 120][:LATENCY_SEGMENTS]
     if len(texts) < LATENCY_SEGMENTS:
         return None

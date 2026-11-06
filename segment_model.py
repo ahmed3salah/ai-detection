@@ -81,15 +81,26 @@ def feature_names(feature_set: str) -> List[str]:
 
 
 class SegmentModel:
-    """A trained paragraph model: texts in, calibrated probabilities out."""
+    """A trained paragraph model, feature-based or transformer: texts in, calibrated probabilities out."""
 
-    def __init__(self, directory: Union[str, Path]):
+    def __init__(self, directory: Union[str, Path], device: Optional[str] = None):
         self.directory = Path(directory)
         self.config = joblib.load(self.directory / "model_config.pkl")
+        self.calibrator = joblib.load(self.directory / "calibrator.pkl")
+        self.is_transformer = self.config.get("classifier_type") == "transformer"
+        if self.is_transformer:
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            from train_transformer import pick_device
+
+            self.device = pick_device(device)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.directory / "model")
+            self.classifier = AutoModelForSequenceClassification.from_pretrained(self.directory / "model").to(self.device)
+            self.scaler = None
+            return
         self.classifier = load_classifier(self.directory / "model_config.pkl", self.directory)
         scaler_path = self.directory / "feature_scaler.pkl"
         self.scaler = joblib.load(scaler_path) if scaler_path.exists() else None
-        self.calibrator = joblib.load(self.directory / "calibrator.pkl")
 
     @property
     def thresholds(self) -> Dict[str, float]:
@@ -98,6 +109,14 @@ class SegmentModel:
     def predict(self, texts: Sequence[str]) -> Tuple[np.ndarray, List[int]]:
         """Calibrated P(AI) for the texts that could be measured, and each one's index into texts."""
         normalized = [normalize_segment(text) for text in texts]
+        if self.is_transformer:
+            from train_transformer import predict_raw
+
+            kept = [i for i, text in enumerate(normalized) if text]
+            if not kept:
+                return np.zeros(0), []
+            raw = predict_raw(self.classifier, self.tokenizer, [texts[i] for i in kept], self.config["max_length"], self.device)
+            return self.calibrator.predict(raw), kept
         rows = feature_rows(normalized, self.config["feature_set"])
         kept = [i for i, row in enumerate(rows) if row is not None and normalized[i] and np.isfinite(row).all()]
         if not kept:
