@@ -588,6 +588,28 @@ class RenderCheckTest(unittest.TestCase):
         rows = [{"heading": "A", "text": "1"}, {"heading": "A", "text": "2"}, {"heading": "B", "text": "3"}]
         self.assertEqual(render.sections_of(rows), [{"heading": "A", "paragraphs": ["1", "2"]}, {"heading": "B", "paragraphs": ["3"]}])
 
+    def test_prints_through_gotenberg_with_the_pages_own_size(self):
+        class Session:
+            def post(self, url, files, data, timeout):
+                self.url, self.files, self.data = url, files, data
+                return type("R", (), {"content": b"%PDF-1.7 ...", "raise_for_status": lambda self: None})()
+
+        session = Session()
+        pdf = render.print_pdf(session, "http://localhost:3000/", "<p>é</p>")
+        self.assertTrue(pdf.startswith(b"%PDF"))
+        self.assertEqual(session.url, "http://localhost:3000/forms/chromium/convert/html")
+        self.assertEqual(session.files["files"][0], "index.html")
+        self.assertEqual(session.files["files"][1], "<p>é</p>".encode("utf-8"))
+        self.assertEqual(session.data["preferCssPageSize"], "true")
+
+    def test_rejects_a_reply_that_is_not_a_pdf(self):
+        class Session:
+            def post(self, *args, **kwargs):
+                return type("R", (), {"content": b"<html>error</html>", "raise_for_status": lambda self: None})()
+
+        with self.assertRaises(RuntimeError):
+            render.print_pdf(Session(), "http://localhost:3000", "<p>x</p>")
+
     def test_pairs_each_test_papers_ai_rows_with_the_human_rows_they_replaced(self):
         rows = human_rows(papers=40, per_paper=4)
         made = gen.build_tasks(rows, 40, 42, TRAINING, HELDOUT)

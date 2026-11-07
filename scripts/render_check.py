@@ -6,16 +6,16 @@ ones were never in a PDF. A model could learn "clean text means AI", which would
 AI-written papers (they go through GROBID too) and flag human text pasted in clean.
 
 For each test paper this builds two documents with identical layout, one from its human paragraphs
-and one from the AI paragraphs that replaced them, prints both to PDF with Edge, reads them back
-through GROBID like production, and scores what comes out. If the model reads the writing, the
-results barely move from scoring the same text directly.
+and one from the AI paragraphs that replaced them, prints both to PDF with headless Chromium
+(Gotenberg), reads them back through GROBID like production, and scores what comes out. If the
+model reads the writing, the results barely move from scoring the same text directly.
 
+    docker run -d --name gotenberg -p 3000:3000 gotenberg/gotenberg:8
     python scripts/render_check.py --artifacts artifacts/<version>
 """
 import argparse
 import html
 import json
-import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -27,11 +27,6 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import segmenter  # noqa: E402
 from segment_dataset import HELDOUT_GENERATOR, TEST, read_jsonl, split_segments  # noqa: E402
-
-EDGE_PATHS = (
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-)
 
 # Two columns of justified serif text, like most conference papers.
 PAGE_CSS = """
@@ -93,15 +88,21 @@ def sections_of(rows: Sequence[Dict]) -> List[Dict]:
     return sections
 
 
-def print_pdf(edge: str, html_path: Path, pdf_path: Path) -> None:
-    subprocess.run(
-        [edge, "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--print-to-pdf={pdf_path}", html_path.resolve().as_uri()],
-        check=True,
+def print_pdf(session: requests.Session, gotenberg_url: str, page: str) -> bytes:
+    """
+    Gotenberg rather than a local browser: Edge headless hangs when started from a non-interactive
+    SSH session on Windows, and took sshd down with it.
+    """
+    response = session.post(
+        f"{gotenberg_url.rstrip('/')}/forms/chromium/convert/html",
+        files={"files": ("index.html", page.encode("utf-8"), "text/html")},
+        data={"preferCssPageSize": "true"},
         timeout=120,
-        capture_output=True,
     )
-    if not pdf_path.exists() or not pdf_path.read_bytes().startswith(b"%PDF"):
-        raise RuntimeError(f"Edge did not write {pdf_path.name}")
+    response.raise_for_status()
+    if not response.content.startswith(b"%PDF"):
+        raise RuntimeError("Gotenberg did not return a PDF")
+    return response.content
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -109,6 +110,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--artifacts", required=True)
     parser.add_argument("--workdir", default="dataset/segments")
     parser.add_argument("--grobid-url", default="http://localhost:8070")
+    parser.add_argument("--gotenberg-url", default="http://localhost:3000")
     parser.add_argument("--papers", type=int, default=0, help="Limit, for a quick look")
     args = parser.parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -116,11 +118,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from build_human_paragraphs import grobid_tei  # noqa: E402
     from segment_model import SegmentModel  # noqa: E402
-
-    edge = next((path for path in EDGE_PATHS if Path(path).exists()), None)
-    if edge is None:
-        print("Microsoft Edge not found; it prints the documents to PDF.")
-        return 1
 
     model = SegmentModel(args.artifacts)
     config = model.config
@@ -147,9 +144,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             name = f"{paper_id.replace(':', '_').replace('/', '_')}-{side}"
             html_path, pdf_path = out_dir / f"{name}.html", out_dir / f"{name}.pdf"
             try:
-                html_path.write_text(document_html(title, sections_of(rows)), encoding="utf-8")
-                print_pdf(edge, html_path, pdf_path)
-                segments = segmenter.from_tei(grobid_tei(session, args.grobid_url, pdf_path.read_bytes()))
+                page = document_html(title, sections_of(rows))
+                html_path.write_text(page, encoding="utf-8")
+                pdf = print_pdf(session, args.gotenberg_url, page)
+                pdf_path.write_bytes(pdf)
+                segments = segmenter.from_tei(grobid_tei(session, args.grobid_url, pdf))
             except Exception as e:
                 results[side]["failed"] += 1
                 print(f"[render] {paper_id} {side}: {type(e).__name__}: {str(e)[:120]}")
