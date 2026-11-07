@@ -105,6 +105,59 @@ class EligibilityTest(unittest.TestCase):
         with self.assertRaises(requests.ReadTimeout):
             next(human.harvest(Flaky(3), "cs", random.Random(1), pause=0, max_failures=3))
 
+    @staticmethod
+    def datacite_page(*records):
+        return {"meta": {"total": len(records)}, "data": [{"attributes": {"doi": f"10.48550/arxiv.{i}", "rightsList": [{"rightsUri": uri}]}} for i, uri in records]}
+
+    @staticmethod
+    def arxiv_api_feed(*entries):
+        body = "".join(
+            f"""<entry><id>http://arxiv.org/abs/{i}v2</id><updated>{updated}</updated><title>Paper {i}</title>
+            <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="{category}"/></entry>"""
+            for i, updated, category in entries
+        )
+        return f'<feed xmlns="http://www.w3.org/2005/Atom">{body}</feed>'.encode()
+
+    def test_datacite_keeps_cc_by_and_cc0_first_submitted_by_2021(self):
+        page = self.datacite_page(
+            ("1907.10121", "https://creativecommons.org/licenses/by/4.0/legalcode"),
+            ("1907.10122", "https://creativecommons.org/publicdomain/zero/1.0/legalcode"),
+            ("1506.02640", "http://arxiv.org/licenses/nonexclusive-distrib/1.0/"),
+            ("1907.10123", "https://creativecommons.org/licenses/by-sa/4.0/legalcode"),
+            ("2201.00001", "https://creativecommons.org/licenses/by/4.0/legalcode"),
+        )
+        self.assertEqual([i for i, _ in human.parse_datacite_page(page)], ["1907.10121", "1907.10122"])
+
+    def test_arxiv_api_keeps_the_domain_and_drops_papers_revised_after_2021(self):
+        licences = {i: BY for i in ("1907.10121", "1907.10122", "1907.10123", "1907.10124")}
+        feed = self.arxiv_api_feed(
+            ("1907.10121", "2019-07-23T20:31:36Z", "cs.MS"),
+            ("1907.10122", "2026-10-29T23:28:14Z", "cs.LG"),
+            ("1907.10123", "2019-07-23T20:31:36Z", "stat.ME"),
+            ("1907.10124", "2020-01-01T00:00:00Z", "cond-mat.str-el"),
+        )
+        self.assertEqual([c.paper_id for c in human.parse_arxiv_api(feed, "cs", licences)], ["arxiv:1907.10121"])
+        self.assertEqual([c.paper_id for c in human.parse_arxiv_api(feed, "physics", licences)], ["arxiv:1907.10124"])
+        self.assertEqual(human.parse_arxiv_api(feed, "cs", licences)[0].arxiv_id, "1907.10121")
+
+    def test_datacite_harvest_asks_arxiv_only_about_open_papers_and_survives_an_outage(self):
+        page = self.datacite_page(("1907.10121", BY), ("1506.02640", "http://arxiv.org/licenses/nonexclusive-distrib/1.0/"))
+        feed = self.arxiv_api_feed(("1907.10121", "2019-07-23T20:31:36Z", "cs.MS"))
+        calls = []
+
+        class Fetcher:
+            def get(self, url, params):
+                calls.append((url, params))
+                if len(calls) == 1:
+                    raise requests.ConnectionError("down")
+                return type("R", (), {"json": lambda self: page, "content": feed})()
+
+        found = next(human.harvest(Fetcher(), "cs", random.Random(1), pause=0, arxiv_metadata="datacite"))
+        self.assertEqual(found.paper_id, "arxiv:1907.10121")
+        self.assertEqual(calls[-1][0], human.ARXIV_API)
+        self.assertEqual(calls[-1][1]["id_list"], "1907.10121")
+        self.assertIn("cc-by-4.0", calls[1][1]["query"])
+
     def test_the_harvest_window_keeps_out_papers_revised_after_2021(self):
         self.assertLessEqual(human.HARVEST_END.year, human.LAST_ALLOWED_YEAR)
 

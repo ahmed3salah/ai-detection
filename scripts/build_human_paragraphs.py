@@ -31,6 +31,8 @@ import segmenter  # noqa: E402
 from segment_dataset import append_jsonl, read_jsonl  # noqa: E402
 
 ARXIV_OAI = "https://oaipmh.arxiv.org/oai"
+ARXIV_API = "https://export.arxiv.org/api/query"
+DATACITE_DOIS = "https://api.datacite.org/dois"
 ARXIV_PDF = "https://export.arxiv.org/pdf/{id}"
 PMC_OAI = "https://pmc.ncbi.nlm.nih.gov/api/oai/v1/mh/"
 
@@ -48,6 +50,24 @@ HARVEST_END = date(LAST_ALLOWED_YEAR, 12, 31)
 
 # Weighted toward the CS and engineering conferences Sparcly serves.
 DOMAIN_WEIGHTS = {"cs": 0.45, "eess": 0.15, "pmc": 0.20, "physics": 0.10, "stat": 0.05, "math": 0.05}
+
+# DataCite holds arXiv's licence for every paper (arXiv registers a DOI per paper), so it stands in
+# for arXiv OAI when that is down. Its subjects narrow a query; the arXiv API's primary category
+# decides the domain, as the OAI set did.
+DATACITE_LICENCES = "rightsList.rightsIdentifier:(cc-by-4.0 OR cc-by-3.0 OR cc0-1.0)"
+DATACITE_SUBJECTS = {
+    "cs": 'subjects.subject:"FOS: Computer and information sciences"',
+    "eess": "subjects.subject:eess*",
+    "physics": 'subjects.subject:"FOS: Physical sciences"',
+    "stat": "subjects.subject:stat*",
+    "math": 'subjects.subject:"FOS: Mathematics"',
+}
+PHYSICS_ARCHIVES = {"physics", "astro-ph", "cond-mat", "gr-qc", "hep-ex", "hep-lat", "hep-ph", "hep-th", "math-ph", "nlin", "nucl-ex", "nucl-th", "quant-ph"}
+DATACITE_PAGE_SIZE = 100
+# DataCite pages no deeper than 10,000 results into a query.
+DATACITE_MAX_RESULTS = 10_000
+ATOM = "{http://www.w3.org/2005/Atom}"
+ARXIV_ATOM = "{http://arxiv.org/schemas/atom}"
 
 OPEN_LICENCE = re.compile(r"creativecommons\.org/(?:licenses/by/|publicdomain/zero/)", re.I)
 MIN_SEGMENTS_PER_PAPER = 5
@@ -150,6 +170,53 @@ def parse_arxiv_records(xml: Union[str, bytes]) -> Tuple[List[Candidate], Option
             arxiv_id=identifier,
         ))
     return candidates, resumption_token(root), len(records)
+
+
+def archive_matches(domain: str, primary_category: str) -> bool:
+    archive = primary_category.split(".")[0]
+    return archive in PHYSICS_ARCHIVES if domain == "physics" else archive == domain
+
+
+def parse_datacite_page(payload: Dict) -> List[Tuple[str, str]]:
+    """(arXiv id, licence URL) of the CC BY / CC0 papers first submitted by the end of 2021."""
+    found = []
+    for item in payload.get("data", []):
+        attributes = item.get("attributes", {})
+        match = re.match(r"10\.48550/arxiv\.(.+)$", attributes.get("doi", ""), re.I)
+        identifier = match.group(1).lower() if match else ""
+        licence = next((r.get("rightsUri", "") for r in attributes.get("rightsList", []) if OPEN_LICENCE.search(r.get("rightsUri", ""))), "")
+        first_year = arxiv_first_year(identifier) if identifier else None
+        if licence and first_year is not None and first_year <= LAST_ALLOWED_YEAR:
+            found.append((identifier, licence))
+    return found
+
+
+def parse_arxiv_api(xml: Union[str, bytes], domain: str, licences: Dict[str, str]) -> List[Candidate]:
+    """
+    Keeps papers whose primary category is in the domain and whose latest version is from 2021 or
+    before: the PDF arXiv serves is the latest version, and one revised later may be LLM-era text.
+    """
+    candidates = []
+    for entry in ET.fromstring(xml).iter(f"{ATOM}entry"):
+        url = text_of(entry.find(f"{ATOM}id"))
+        identifier = re.sub(r"v\d+$", "", url.split("/abs/", 1)[-1])
+        primary = entry.find(f"{ARXIV_ATOM}primary_category")
+        category = primary.get("term", "") if primary is not None else ""
+        updated = text_of(entry.find(f"{ATOM}updated"))
+        licence = licences.get(identifier.lower(), "")
+        first_year = arxiv_first_year(identifier)
+        if not licence or not category or not archive_matches(domain, category) or not updated or int(updated[:4]) > LAST_ALLOWED_YEAR:
+            continue
+        candidates.append(Candidate(
+            paper_id=f"arxiv:{identifier}",
+            domain=category.split(".")[0],
+            title=text_of(entry.find(f"{ATOM}title")),
+            licence=licence,
+            first_date=str(first_year),
+            source_url=f"https://arxiv.org/abs/{identifier}",
+            arxiv_id=identifier,
+        ))
+    return candidates
 
 
 def resumption_token(root: ET.Element) -> Optional[str]:
@@ -288,12 +355,48 @@ class Fetcher:
         raise RuntimeError(f"Gave up on {url}")
 
 
+def harvest_datacite(
+    fetcher: Fetcher,
+    domain: str,
+    rng: random.Random,
+    pause: float = HARVEST_OUTAGE_PAUSE_SECONDS,
+    max_failures: int = HARVEST_MAX_CONSECUTIVE_FAILURES,
+) -> Iterator[Candidate]:
+    """Eligible arXiv papers of a domain from random pages of random years, via DataCite and the arXiv API."""
+    totals: Dict[int, int] = {}
+    failures = 0
+    while True:
+        year = rng.randrange(HARVEST_START.year, LAST_ALLOWED_YEAR + 1)
+        query = f"{DATACITE_LICENCES} AND publicationYear:{year} AND {DATACITE_SUBJECTS[domain]}"
+        pages = max(1, min(totals.get(year, DATACITE_PAGE_SIZE), DATACITE_MAX_RESULTS) // DATACITE_PAGE_SIZE)
+        params = {"client-id": "arxiv.content", "query": query, "page[size]": DATACITE_PAGE_SIZE, "page[number]": rng.randrange(1, pages + 1), "fields[dois]": "doi,rightsList"}
+        try:
+            payload = fetcher.get(DATACITE_DOIS, params).json()
+            totals[year] = int(payload.get("meta", {}).get("total") or 0)
+            licences = {identifier.lower(): licence for identifier, licence in parse_datacite_page(payload)}
+            candidates = []
+            if licences:
+                xml = fetcher.get(ARXIV_API, {"id_list": ",".join(licences), "max_results": len(licences)}).content
+                candidates = parse_arxiv_api(xml, domain, licences)
+        except (requests.RequestException, RuntimeError, ValueError, ET.ParseError) as e:
+            failures += 1
+            if failures >= max_failures:
+                raise
+            print(f"[harvest] {domain}: {type(e).__name__}, pausing {pause:.0f}s ({failures}/{max_failures})", flush=True)
+            time.sleep(pause)
+            continue
+        failures = 0
+        rng.shuffle(candidates)
+        yield from candidates
+
+
 def harvest(
     fetcher: Fetcher,
     domain: str,
     rng: random.Random,
     pause: float = HARVEST_OUTAGE_PAUSE_SECONDS,
     max_failures: int = HARVEST_MAX_CONSECUTIVE_FAILURES,
+    arxiv_metadata: str = "oai",
 ) -> Iterator[Candidate]:
     """
     Eligible papers of a domain, from random weeks of 2016-2021 so no one period dominates.
@@ -301,6 +404,9 @@ def harvest(
     The date window also keeps out later revisions: OAI selects on a record's last change, so a paper
     revised after 2021 isn't returned, and the PDF fetched is the version written before LLMs.
     """
+    if domain != "pmc" and arxiv_metadata == "datacite":
+        yield from harvest_datacite(fetcher, domain, rng, pause, max_failures)
+        return
     span = (HARVEST_END - HARVEST_START).days
     failures = 0
     while True:
@@ -461,7 +567,7 @@ def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
                     except Exception as e:  # One bad PDF costs that paper, not the run.
                         record(candidate, domain, None, f"{type(e).__name__}: {e}")
 
-            for candidate in harvest(fetcher, domain, rng):
+            for candidate in harvest(fetcher, domain, rng, arxiv_metadata=args.arxiv_metadata):
                 if stats[domain]["accepted"] + len(pending) >= target:
                     drain(0)
                     if stats[domain]["accepted"] >= target:
@@ -499,6 +605,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--workers", type=int, default=4, help="PDFs GROBID reads at once")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-arxiv", action="store_true", help="PMC only: needs no GROBID")
+    parser.add_argument(
+        "--arxiv-metadata",
+        choices=("oai", "datacite"),
+        default="oai",
+        help="Where arXiv licences come from: arXiv OAI, or DataCite plus the arXiv API when OAI is down",
+    )
     args = parser.parse_args(argv)
 
     stats = build(args)
