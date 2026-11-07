@@ -30,7 +30,10 @@ from segment_dataset import CALIBRATION, TRAIN, DatasetError, Row, load_segments
 from text_normalize import NORMALIZATION_VERSION, normalize_segment
 from train_segments import LIKELY_AI_FPR, POSSIBLY_AI_FPR, TrainingAborted, threshold_for_fpr
 
-DEFAULT_BASE_MODEL = "distilroberta-base"
+# On the pilot (same data and split) SciBERT beat distilroberta-base and roberta-base: it alone passed
+# the human FPR gate (0.96%) and caught the most held-out-generator text (82%), at 4.8 s per 25
+# paragraphs on CPU.
+DEFAULT_BASE_MODEL = "allenai/scibert_scivocab_uncased"
 # Paragraphs run to about 300 words, which is roughly 400 tokens: 384 covers nearly all of them.
 DEFAULT_MAX_LENGTH = 384
 
