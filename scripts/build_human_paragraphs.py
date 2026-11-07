@@ -36,6 +36,10 @@ PMC_OAI = "https://pmc.ncbi.nlm.nih.gov/api/oai/v1/mh/"
 
 # arXiv asks for no more than one request every 3 seconds.
 POLITE_DELAY_SECONDS = 3.1
+# A source that stops answering (arXiv OAI hung for over ten minutes on 2026-11-07) pauses the
+# harvest instead of ending the run; about an hour of straight failures ends it.
+HARVEST_OUTAGE_PAUSE_SECONDS = 300
+HARVEST_MAX_CONSECUTIVE_FAILURES = 12
 USER_AGENT = "sparcly-ai-detection-dataset/1.0 (research; open-licensed papers only)"
 
 LAST_ALLOWED_YEAR = 2021
@@ -284,7 +288,13 @@ class Fetcher:
         raise RuntimeError(f"Gave up on {url}")
 
 
-def harvest(fetcher: Fetcher, domain: str, rng: random.Random) -> Iterator[Candidate]:
+def harvest(
+    fetcher: Fetcher,
+    domain: str,
+    rng: random.Random,
+    pause: float = HARVEST_OUTAGE_PAUSE_SECONDS,
+    max_failures: int = HARVEST_MAX_CONSECUTIVE_FAILURES,
+) -> Iterator[Candidate]:
     """
     Eligible papers of a domain, from random weeks of 2016-2021 so no one period dominates.
 
@@ -292,6 +302,7 @@ def harvest(fetcher: Fetcher, domain: str, rng: random.Random) -> Iterator[Candi
     revised after 2021 isn't returned, and the PDF fetched is the version written before LLMs.
     """
     span = (HARVEST_END - HARVEST_START).days
+    failures = 0
     while True:
         start = HARVEST_START + timedelta(days=rng.randrange(span))
         end = min(start + timedelta(days=6), HARVEST_END)
@@ -305,7 +316,16 @@ def harvest(fetcher: Fetcher, domain: str, rng: random.Random) -> Iterator[Candi
         for _ in range(3):  # Up to three pages of a week, then on to another week.
             # Bytes, so the XML parser reads the encoding: arXiv sends text/xml with no charset,
             # which requests would decode as Latin-1 and garble.
-            xml = fetcher.get(url, params).content
+            try:
+                xml = fetcher.get(url, params).content
+            except (requests.RequestException, RuntimeError) as e:
+                failures += 1
+                if failures >= max_failures:
+                    raise
+                print(f"[harvest] {domain}: {type(e).__name__}, pausing {pause:.0f}s ({failures}/{max_failures})", flush=True)
+                time.sleep(pause)
+                break  # On to another week.
+            failures = 0
             candidates, token, _ = parse(xml)
             rng.shuffle(candidates)
             yield from candidates

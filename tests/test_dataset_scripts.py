@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
+import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -85,6 +86,24 @@ class EligibilityTest(unittest.TestCase):
         self.assertEqual(human.arxiv_first_year("2008.03408"), 2020)
         candidates, _, _ = human.parse_arxiv_records(arxiv_page([("2001.00001", "2020-01-01", BY, "q-bio.GN cs.LG")]))
         self.assertEqual(candidates[0].domain, "q-bio")
+
+    def test_harvest_pauses_through_an_outage_and_gives_up_after_too_many(self):
+        page = arxiv_page([("1902.10899", "2019-02-27", BY, "cs.LG")])
+
+        class Flaky:
+            def __init__(self, failures):
+                self.failures = failures
+
+            def get(self, url, params):
+                if self.failures:
+                    self.failures -= 1
+                    raise requests.ReadTimeout("hung")
+                return type("R", (), {"content": page})()
+
+        found = next(human.harvest(Flaky(2), "cs", random.Random(1), pause=0, max_failures=3))
+        self.assertEqual(found.paper_id, "arxiv:1902.10899")
+        with self.assertRaises(requests.ReadTimeout):
+            next(human.harvest(Flaky(3), "cs", random.Random(1), pause=0, max_failures=3))
 
     def test_the_harvest_window_keeps_out_papers_revised_after_2021(self):
         self.assertLessEqual(human.HARVEST_END.year, human.LAST_ALLOWED_YEAR)
