@@ -165,6 +165,36 @@ class EligibilityTest(unittest.TestCase):
         self.assertEqual(seen["args"].domains, ["cs", "eess"])
         self.assertEqual(seen["args"].arxiv_metadata, "datacite")
 
+    def test_pmc_bucket_keeps_only_final_cc_by_and_cc0_articles(self):
+        base = {"is_pmc_openaccess": True, "is_manuscript": False, "is_retracted": False, "is_historical_ocr": False}
+        self.assertIn("licenses/by/", human.pmc_s3_licence({**base, "license_code": "CC BY"}))
+        self.assertIn("publicdomain/zero", human.pmc_s3_licence({**base, "license_code": "CC0"}))
+        for change in ({"license_code": "CC BY-NC"}, {"license_code": "TDM"}, {"license_code": None}, {"license_code": "CC BY", "is_manuscript": True}, {"license_code": "CC BY", "is_retracted": True}):
+            self.assertEqual(human.pmc_s3_licence({**base, **change}), "", change)
+
+    def test_pmc_bucket_harvest_skips_missing_and_closed_articles(self):
+        article = pmc_article("7", year="2019").split("<metadata>", 1)[1].rsplit("</metadata>", 1)[0].strip()
+        late = pmc_article("8", year="2023").split("<metadata>", 1)[1].rsplit("</metadata>", 1)[0].strip()
+        open_meta = {"is_pmc_openaccess": True, "license_code": "CC BY"}
+        replies = iter([(404, None), (200, {"is_pmc_openaccess": True, "license_code": "CC BY-NC"}), (200, open_meta), (200, late), (200, open_meta), (200, article)])
+        urls = []
+
+        class Session:
+            headers = {}
+
+            def get(self, url, params=None, timeout=None):
+                urls.append(url)
+                status, body = next(replies)
+                response = requests.Response()
+                response.status_code = status
+                response._content = json.dumps(body).encode() if isinstance(body, dict) else (body or "").encode()
+                return response
+
+        found = next(human.harvest(type("F", (), {"session": Session()})(), "pmc", random.Random(1), pause=0, pmc_source="s3"))
+        self.assertEqual(found.first_date, "2019")
+        self.assertIn("licenses/by/", found.licence)
+        self.assertEqual(sum(url.endswith(".xml") for url in urls), 2)
+
     def test_the_harvest_window_keeps_out_papers_revised_after_2021(self):
         self.assertLessEqual(human.HARVEST_END.year, human.LAST_ALLOWED_YEAR)
 

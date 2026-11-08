@@ -35,6 +35,14 @@ ARXIV_API = "https://export.arxiv.org/api/query"
 DATACITE_DOIS = "https://api.datacite.org/dois"
 ARXIV_PDF = "https://export.arxiv.org/pdf/{id}"
 PMC_OAI = "https://pmc.ncbi.nlm.nih.gov/api/oai/v1/mh/"
+# PMC's AWS Open Data bucket: a metadata JSON per article (licence code, manuscript flag) and its JATS.
+# Only about one pmc-open OAI record in six is CC BY or CC0, ten to a page, so OAI yields about one
+# paper per page; random ids here hit about half the time and the bucket has no request pacing.
+PMC_S3 = "https://pmc-oa-opendata.s3.amazonaws.com"
+PMC_S3_LICENCES = {"CC BY": "https://creativecommons.org/licenses/by/4.0/", "CC0": "https://creativecommons.org/publicdomain/zero/1.0/"}
+# PMC ids assigned to articles published around 2016-2021; the pub-date check decides.
+PMC_ID_RANGE = (4_700_000, 8_800_000)
+PMC_S3_DELAY_SECONDS = 0.2
 
 # arXiv asks for no more than one request every 3 seconds.
 POLITE_DELAY_SECONDS = 3.1
@@ -248,23 +256,71 @@ def parse_pmc_records(xml: Union[str, bytes]) -> Tuple[List[Candidate], Optional
     for record in records:
         article = find_local(record, "article")
         identifier = find_local(record, "identifier")
-        if article is None or identifier is None or not identifier.text or find_local(article, "body") is None:
+        if article is None or identifier is None or not identifier.text:
             continue
-        pmc_id = identifier.text.rsplit(":", 1)[-1]
-        licence = jats_licence(article)
-        years = [int(text_of(y)) for pub in article.iter() if local_name(pub) == "pub-date" for y in pub if local_name(y) == "year" and text_of(y).isdigit()]
-        if not OPEN_LICENCE.search(licence) or not years or min(years) > LAST_ALLOWED_YEAR:
-            continue
-        candidates.append(Candidate(
-            paper_id=f"pmc:{pmc_id}",
-            domain="pmc",
-            title=text_of(find_local(article, "article-title")),
-            licence=licence,
-            first_date=str(min(years)),
-            source_url=f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/",
-            jats=article,
-        ))
+        candidate = pmc_candidate(article, identifier.text.rsplit(":", 1)[-1], jats_licence(article))
+        if candidate is not None:
+            candidates.append(candidate)
     return candidates, resumption_token(root), len(records)
+
+
+def pmc_candidate(article: ET.Element, pmc_id: str, licence: str) -> Optional[Candidate]:
+    """A PMC article with full text, an open licence and a publication year of 2021 or before."""
+    years = [int(text_of(y)) for pub in article.iter() if local_name(pub) == "pub-date" for y in pub if local_name(y) == "year" and text_of(y).isdigit()]
+    if find_local(article, "body") is None or not OPEN_LICENCE.search(licence) or not years or min(years) > LAST_ALLOWED_YEAR:
+        return None
+    return Candidate(
+        paper_id=f"pmc:{pmc_id}",
+        domain="pmc",
+        title=text_of(find_local(article, "article-title")),
+        licence=licence,
+        first_date=str(min(years)),
+        source_url=f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/",
+        jats=article,
+    )
+
+
+def pmc_s3_licence(metadata: Dict) -> str:
+    """The licence URL for a bucket article that is CC BY or CC0 and a final, unretracted article."""
+    if metadata.get("is_manuscript") or metadata.get("is_retracted") or metadata.get("is_historical_ocr") or not metadata.get("is_pmc_openaccess"):
+        return ""
+    return PMC_S3_LICENCES.get(metadata.get("license_code") or "", "")
+
+
+def harvest_pmc_s3(
+    fetcher: "Fetcher",
+    rng: random.Random,
+    pause: float = HARVEST_OUTAGE_PAUSE_SECONDS,
+    max_failures: int = HARVEST_MAX_CONSECUTIVE_FAILURES,
+) -> Iterator[Candidate]:
+    """Eligible PMC articles at random ids, from PMC's AWS Open Data bucket."""
+    bucket = Fetcher(fetcher.session, delay=PMC_S3_DELAY_SECONDS)
+    failures = 0
+    while True:
+        pmc_id = str(rng.randrange(*PMC_ID_RANGE))
+        try:
+            try:
+                metadata = bucket.get(f"{PMC_S3}/metadata/PMC{pmc_id}.1.json", attempts=3).json()
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code in (403, 404):  # No such article.
+                    failures = 0
+                    continue
+                raise
+            licence = pmc_s3_licence(metadata)
+            article = ET.fromstring(bucket.get(f"{PMC_S3}/PMC{pmc_id}.1/PMC{pmc_id}.1.xml", attempts=3).content) if licence else None
+        except (requests.RequestException, RuntimeError, ValueError, ET.ParseError) as e:
+            failures += 1
+            if failures >= max_failures:
+                raise
+            print(f"[harvest] pmc: {type(e).__name__}, pausing {pause:.0f}s ({failures}/{max_failures})", flush=True)
+            time.sleep(pause)
+            continue
+        failures = 0
+        if article is not None and local_name(article) == "article":
+            declared = jats_licence(article)  # Names the licence version, when the article has one.
+            candidate = pmc_candidate(article, pmc_id, declared if OPEN_LICENCE.search(declared) else licence)
+            if candidate is not None:
+                yield candidate
 
 
 def _jats_prose(element: ET.Element) -> str:
@@ -397,6 +453,7 @@ def harvest(
     pause: float = HARVEST_OUTAGE_PAUSE_SECONDS,
     max_failures: int = HARVEST_MAX_CONSECUTIVE_FAILURES,
     arxiv_metadata: str = "oai",
+    pmc_source: str = "oai",
 ) -> Iterator[Candidate]:
     """
     Eligible papers of a domain, from random weeks of 2016-2021 so no one period dominates.
@@ -404,6 +461,9 @@ def harvest(
     The date window also keeps out later revisions: OAI selects on a record's last change, so a paper
     revised after 2021 isn't returned, and the PDF fetched is the version written before LLMs.
     """
+    if domain == "pmc" and pmc_source == "s3":
+        yield from harvest_pmc_s3(fetcher, rng, pause, max_failures)
+        return
     if domain != "pmc" and arxiv_metadata == "datacite":
         yield from harvest_datacite(fetcher, domain, rng, pause, max_failures)
         return
@@ -567,7 +627,7 @@ def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
                     except Exception as e:  # One bad PDF costs that paper, not the run.
                         record(candidate, domain, None, f"{type(e).__name__}: {e}")
 
-            for candidate in harvest(fetcher, domain, rng, arxiv_metadata=args.arxiv_metadata):
+            for candidate in harvest(fetcher, domain, rng, arxiv_metadata=args.arxiv_metadata, pmc_source=args.pmc_source):
                 if stats[domain]["accepted"] + len(pending) >= target:
                     drain(0)
                     if stats[domain]["accepted"] >= target:
@@ -610,6 +670,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=lambda value: [d.strip() for d in value.split(",") if d.strip()],
         default=[],
         help="Only these quotas, e.g. cs,eess (the quota sizes still come from --papers)",
+    )
+    parser.add_argument(
+        "--pmc-source",
+        choices=("oai", "s3"),
+        default="oai",
+        help="PMC OAI, or PMC's AWS Open Data bucket (much faster: OAI pages are mostly non-CC BY)",
     )
     parser.add_argument(
         "--arxiv-metadata",
