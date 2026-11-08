@@ -158,6 +158,13 @@ class EligibilityTest(unittest.TestCase):
         self.assertEqual(calls[-1][1]["id_list"], "1907.10121")
         self.assertIn("cc-by-4.0", calls[1][1]["query"])
 
+    def test_domains_limits_the_run_to_the_named_quotas(self):
+        seen = {}
+        with unittest.mock.patch.object(human, "build", side_effect=lambda args: seen.setdefault("args", args) and {}):
+            human.main(["--papers", "10", "--domains", "cs, eess", "--arxiv-metadata", "datacite"])
+        self.assertEqual(seen["args"].domains, ["cs", "eess"])
+        self.assertEqual(seen["args"].arxiv_metadata, "datacite")
+
     def test_the_harvest_window_keeps_out_papers_revised_after_2021(self):
         self.assertLessEqual(human.HARVEST_END.year, human.LAST_ALLOWED_YEAR)
 

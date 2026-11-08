@@ -555,7 +555,7 @@ def build(args: argparse.Namespace) -> Dict[str, Dict[str, int]]:
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for domain, target in targets.items():
-            if domain != "pmc" and args.no_arxiv:
+            if (domain != "pmc" and args.no_arxiv) or (args.domains and domain not in args.domains):
                 continue
             pending: List[Tuple[Candidate, Future]] = []
 
@@ -605,6 +605,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--workers", type=int, default=4, help="PDFs GROBID reads at once")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-arxiv", action="store_true", help="PMC only: needs no GROBID")
+    parser.add_argument(
+        "--domains",
+        type=lambda value: [d.strip() for d in value.split(",") if d.strip()],
+        default=[],
+        help="Only these quotas, e.g. cs,eess (the quota sizes still come from --papers)",
+    )
     parser.add_argument(
         "--arxiv-metadata",
         choices=("oai", "datacite"),
