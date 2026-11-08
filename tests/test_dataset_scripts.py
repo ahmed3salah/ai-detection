@@ -550,6 +550,22 @@ class OpenRouterCallTest(unittest.TestCase):
         gen.openrouter_completion(session, "key", self.task, PRICING)
         self.assertNotIn("reasoning", self.bodies[-1])
 
+    def test_parallel_refusals_of_one_setting_step_down_once(self):
+        # Another worker already stepped this model down to no setting while this request was out.
+        test = self
+        answers = [self.Answer(400), self.Answer(200, self.OK)]
+        self.bodies = []
+
+        class Session:
+            def post(self, url, json, headers, timeout):
+                test.bodies.append(dict(json))
+                gen._REASONING_SETTING_FOR[test.task.model] = len(gen.REASONING_SETTINGS) - 1
+                return answers.pop(0)
+
+        reply = gen.openrouter_completion(Session(), "key", self.task, PRICING)
+        self.assertEqual(reply["text"], "Text.")
+        self.assertNotIn("reasoning", self.bodies[-1])
+
     def test_a_400_without_any_setting_is_a_real_error(self):
         session = self.session(*[self.Answer(400)] * 4)
         with self.assertRaisesRegex(RuntimeError, "HTTP 400"):

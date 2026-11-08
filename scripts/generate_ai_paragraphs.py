@@ -317,8 +317,12 @@ def openrouter_completion(session: requests.Session, api_key: str, task: Task, p
         "temperature": 0.7,
         "usage": {"include": True},
     }
+    sent = 0
+
     def apply_reasoning_setting() -> None:
-        setting = REASONING_SETTINGS[_REASONING_SETTING_FOR.get(task.model, 0)]
+        nonlocal sent
+        sent = _REASONING_SETTING_FOR.get(task.model, 0)
+        setting = REASONING_SETTINGS[sent]
         if setting is None:
             body.pop("reasoning", None)
         else:
@@ -337,7 +341,9 @@ def openrouter_completion(session: requests.Session, api_key: str, task: Task, p
             time.sleep(10 * (attempt + 1))
             continue
         if response.status_code == 400 and "reasoning" in body:
-            _REASONING_SETTING_FOR[task.model] = _REASONING_SETTING_FOR.get(task.model, 0) + 1
+            # Workers refused the same setting in parallel step down once, from what they sent.
+            stepped = max(_REASONING_SETTING_FOR.get(task.model, 0), sent + 1)
+            _REASONING_SETTING_FOR[task.model] = min(stepped, len(REASONING_SETTINGS) - 1)
             apply_reasoning_setting()
             continue
         if response.status_code != 200:
