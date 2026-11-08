@@ -74,6 +74,28 @@ class TransformerTrainingTest(unittest.TestCase):
         self.assertIsNotNone(report["gates"]["cpu_latency"]["measured"]["seconds"])
         self.assertIsNotNone(report["gates"]["no_parens_digits_shortcut"]["measured"]["drop"])
 
+    def test_the_api_serves_it_calibrated(self):
+        from fastapi.testclient import TestClient
+
+        import app as app_module
+
+        rng = random.Random(9)
+        segments = [{"id": "h", "text": paragraph(HUMAN_SENTENCES, 100, rng)}, {"id": "a", "text": paragraph(AI_SENTENCES, 100, rng)}]
+        with patch.object(app_module, "SEGMENT_MODEL_DIR", self.artifacts), patch.object(app_module, "_segment_model", None), patch.object(
+            app_module, "_get_classifier", side_effect=AssertionError("v1 classifier used")
+        ):
+            client = TestClient(app_module.app)
+            body = client.post("/v2/score-segments", json={"segments": segments}).json()
+            info = client.get("/v2/model-info").json()
+
+        self.assertEqual(body["model_version"], "tiny")
+        self.assertIs(body["calibrated"], True)
+        self.assertEqual(body["thresholds"], SegmentModel(self.artifacts, device="cpu").thresholds)
+        by_id = {s["id"]: s for s in body["segments"]}
+        self.assertTrue(by_id["h"]["scoring_ok"] and by_id["a"]["scoring_ok"])
+        self.assertLess(by_id["h"]["ai_probability"], by_id["a"]["ai_probability"])
+        self.assertEqual(info["model_type"], "transformer")
+
     def test_refuses_to_overwrite_and_leaves_nothing_after_a_crash(self):
         with self.assertRaisesRegex(ts.TrainingAborted, "never overwritten"):
             self.tt.train(self.data, out_root=self.out, version="tiny", base_model=self.base, epochs=1, device="cpu")

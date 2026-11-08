@@ -69,8 +69,7 @@ def _failed(segment_id: Any, error_class: Optional[str]) -> Dict[str, Any]:
 
 def score_segments(
     segments: Sequence[Tuple[Any, str]],
-    classifier: Any,
-    build_feature_batch: Callable[[List[str]], Tuple[np.ndarray, List[int]]],
+    predict: Callable[[List[str]], Tuple[np.ndarray, List[int]]],
     thresholds: Dict[str, float],
     *,
     debug: bool = False,
@@ -78,8 +77,8 @@ def score_segments(
     """
     Score (id, text) pairs and return one result per pair, in the order given.
 
-    build_feature_batch takes texts and returns the feature matrix of those it could measure,
-    with the indices into its input that each row belongs to.
+    predict takes texts and returns P(AI) for those it could score, with the index into its input
+    that each probability belongs to.
     """
     results: List[Optional[Dict[str, Any]]] = [None] * len(segments)
     scorable: List[int] = []
@@ -97,11 +96,9 @@ def score_segments(
     error_class: Optional[str] = None
     if scorable:
         try:
-            matrix, kept = build_feature_batch([segments[position][1] for position in scorable])
-            if kept:
-                row_probabilities = classifier.predict_proba(matrix)[:, 1]
-                for row, kept_index in enumerate(kept):
-                    probabilities[scorable[kept_index]] = float(row_probabilities[row])
+            row_probabilities, kept = predict([segments[position][1] for position in scorable])
+            for row, kept_index in enumerate(kept):
+                probabilities[scorable[kept_index]] = float(row_probabilities[row])
         except Exception as e:
             # Ids only: the text is an unpublished manuscript.
             logger.exception("Scoring failed for a batch of %d segments", len(scorable))

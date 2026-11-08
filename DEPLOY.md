@@ -10,7 +10,7 @@
 
 ## S3 model sync (recommended for production)
 
-On container start, [`docker-entrypoint.sh`](docker-entrypoint.sh) runs [`scripts/sync_model_from_s3.py`](scripts/sync_model_from_s3.py) when **`MODEL_S3_URI`** or **`MODEL_S3_BUCKET`** is set. It downloads into **`MODEL_SYNC_DEST`** (default: current working directory, **`/app`** in the image).
+On container start, [`docker-entrypoint.sh`](docker-entrypoint.sh) runs [`scripts/sync_model_from_s3.py`](scripts/sync_model_from_s3.py) when **`MODEL_S3_URI`**, **`MODEL_S3_BUCKET`** or **`PARAGRAPH_MODEL_S3_URI`** is set. It downloads into **`MODEL_SYNC_DEST`** (default: current working directory, **`/app`** in the image).
 
 | Variable | Meaning |
 |----------|---------|
@@ -20,6 +20,7 @@ On container start, [`docker-entrypoint.sh`](docker-entrypoint.sh) runs [`script
 | `MODEL_S3_EXTRA_FILES` | Comma-separated extra basenames to allow under a prefix. |
 | `MODEL_S3_ALLOW_ANY` | Set to `1` to download every object under a **non-empty** prefix (basename → `/app`; collisions overwrite). Not allowed with an empty prefix. |
 | `MODEL_SYNC_DEST` | Override download directory (tests / custom layouts). |
+| `PARAGRAPH_MODEL_S3_URI` | The paragraph model `/v2/score-segments` serves: the prefix of one `train_transformer.py` artifacts directory, e.g. `s3://my-bucket/inference/paragraph/scibert-full-1108`. Every object under it is downloaded with its folder layout into `PARAGRAPH_MODEL_SYNC_DEST` (default `paragraph_model`, which the app reads; override the app side with `DETECTION_SEGMENT_MODEL_DIR`). It replaces the old directory only when every file arrived. Without it, v2 falls back to the v1 model with provisional bands (`calibrated: false`). |
 
 **IAM (ECS task role):** grant `s3:ListBucket` on the bucket (scoped by prefix in the policy `Condition` if possible) and `s3:GetObject` on `arn:...:bucket/name/prefix/*`. For bucket-root mode (empty prefix), grant `GetObject` on `arn:...:bucket/name/model.pkl` etc.  
 **Credentials:** the sync script uses the standard AWS SDK chain. On **ECS/Fargate**, attach a **task role** with those S3 actions (no access keys in the task). The error `Unable to locate credentials` means nothing in the environment provided keys or a role.

@@ -19,7 +19,7 @@ import random
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -29,6 +29,7 @@ from sklearn.isotonic import IsotonicRegression
 from segment_dataset import CALIBRATION, TRAIN, DatasetError, Row, load_segments, split_counts, split_segments
 from text_normalize import NORMALIZATION_VERSION, normalize_segment
 from train_segments import LIKELY_AI_FPR, POSSIBLY_AI_FPR, TrainingAborted, threshold_for_fpr
+from transformer_inference import encode, pick_device, predict_raw
 
 # On the pilot (same data and split) SciBERT beat distilroberta-base and roberta-base: it alone passed
 # the human FPR gate (0.96%) and caught the most held-out-generator text (82%), at 4.8 s per 25
@@ -36,40 +37,6 @@ from train_segments import LIKELY_AI_FPR, POSSIBLY_AI_FPR, TrainingAborted, thre
 DEFAULT_BASE_MODEL = "allenai/scibert_scivocab_uncased"
 # Paragraphs run to about 300 words, which is roughly 400 tokens: 384 covers nearly all of them.
 DEFAULT_MAX_LENGTH = 384
-
-
-def pick_device(requested: Optional[str] = None) -> torch.device:
-    if requested:
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def encode(tokenizer, texts: Sequence[str], max_length: int) -> Dict[str, torch.Tensor]:
-    return tokenizer(
-        [normalize_segment(text) for text in texts],
-        truncation=True,
-        max_length=max_length,
-        padding=True,
-        return_tensors="pt",
-    )
-
-
-def predict_raw(model, tokenizer, texts: Sequence[str], max_length: int, device: torch.device, batch_size: int = 32) -> np.ndarray:
-    """P(AI) before calibration, in the order given."""
-    model.eval()
-    out: List[float] = []
-    with torch.no_grad():
-        for start in range(0, len(texts), batch_size):
-            batch = {k: v.to(device) for k, v in encode(tokenizer, texts[start : start + batch_size], max_length).items()}
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits = model(**batch).logits
-            out.extend(torch.softmax(logits.float(), dim=-1)[:, 1].cpu().tolist())
-    return np.array(out, dtype=np.float64)
 
 
 def usable(rows: Sequence[Row], split: str) -> List[Row]:

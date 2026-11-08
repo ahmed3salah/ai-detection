@@ -24,3 +24,5 @@ model.pkl
 model_config.pkl
 feature_scaler.pkl
 tfidf_vectorizer.pkl
+artifacts
+paragraph_model

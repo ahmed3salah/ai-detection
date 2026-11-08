@@ -8,7 +8,7 @@ import secrets
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, Iterator, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Iterator, List, Literal, NamedTuple, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -24,6 +24,7 @@ from features import (
 )
 from classifier_mlp import load_classifier
 import segment_scoring
+from segment_model import SegmentModel
 from text_normalize import normalize_segment
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,12 @@ _feature_scaler = None
 _feature_scaler_checked = False
 _feature_mismatch_detail: Optional[str] = None
 _model_version: Optional[str] = None
+
+# The paragraph model /v2/score-segments serves: an artifacts directory from train_transformer.py or
+# train_segments.py. Without one, v2 falls back to the v1 classifier with provisional bands.
+SEGMENT_MODEL_DIR = Path(os.environ.get("DETECTION_SEGMENT_MODEL_DIR", "paragraph_model"))
+_segment_model: Optional[SegmentModel] = None
+_SEGMENT_MODEL_LOAD_LOCK = threading.Lock()
 
 # One inference at a time per process: spaCy's shared vocab and the lazy model loads are not
 # built for concurrent use, and parallel forward passes only fight over the same CPU cores.
@@ -304,10 +311,63 @@ def _classifier_load_error(clf: Any) -> Optional[str]:
     )
 
 
+def _get_segment_model() -> Optional[SegmentModel]:
+    """
+    The deployed paragraph model, or None when there is none. One that is deployed but won't load
+    is a 503: falling back to v1 would hand out uncalibrated scores as if nothing were wrong.
+    """
+    global _segment_model
+    if _segment_model is not None:
+        return _segment_model
+    if not (SEGMENT_MODEL_DIR / "model_config.pkl").exists():
+        return None
+    with _SEGMENT_MODEL_LOAD_LOCK:
+        if _segment_model is None:
+            try:
+                _segment_model = SegmentModel(SEGMENT_MODEL_DIR, device="cpu")
+            except Exception as e:
+                logger.exception("The paragraph model in %s failed to load", SEGMENT_MODEL_DIR)
+                raise HTTPException(status_code=503, detail=f"Paragraph model failed to load ({type(e).__name__}).") from e
+    return _segment_model
+
+
+class _ParagraphScorer(NamedTuple):
+    predict: Callable[[List[str]], Tuple[np.ndarray, List[int]]]
+    thresholds: dict
+    calibrated: bool
+    model_version: str
+    model_type: str
+    uses_perplexity: bool
+
+
+def _paragraph_scorer() -> _ParagraphScorer:
+    """What v2 scores with: the deployed paragraph model, or the v1 classifier when there is none."""
+    paragraph_model = _get_segment_model()
+    if paragraph_model is not None:
+        thresholds, calibrated = segment_scoring.resolve_thresholds(paragraph_model.config)
+        version = str(paragraph_model.config.get("model_version") or "paragraph-model").strip()[:64]
+        model_type = paragraph_model.config.get("classifier_type") or "features"
+        return _ParagraphScorer(paragraph_model.predict, thresholds, calibrated, version, model_type, False)
+
+    classifier = _get_classifier()
+    config = _get_config()
+
+    def predict(texts: List[str]) -> Tuple[np.ndarray, List[int]]:
+        matrix, kept = _build_feature_batch(texts, config)
+        return (classifier.predict_proba(matrix)[:, 1] if kept else np.zeros(0)), kept
+
+    thresholds, calibrated = segment_scoring.resolve_thresholds(config)
+    return _ParagraphScorer(predict, thresholds, calibrated, _get_model_version(config), "v1", _model_learned_from_perplexity(config))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _classifier, _feature_mismatch_detail
     _feature_mismatch_detail = None
+    try:
+        _get_segment_model()
+    except HTTPException:
+        pass  # Logged; /ready and v2 answer 503 until it is fixed.
     try:
         clf = load_classifier(config_path="model_config.pkl", model_dir=".")
     except FileNotFoundError:
@@ -354,9 +414,10 @@ def health():
 
 @app.get("/ready")
 def ready():
-    """Readiness: classifier loaded and consistent with feature pipeline."""
+    """Readiness: classifier loaded and consistent with feature pipeline, and the paragraph model if one is deployed."""
     if _feature_mismatch_detail is not None:
         raise HTTPException(status_code=503, detail=_feature_mismatch_detail)
+    _get_segment_model()
     _get_classifier()
     return {"ready": True}
 
@@ -501,23 +562,20 @@ def score_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detecti
     if too_big is not None:
         raise HTTPException(status_code=413, detail=too_big)
 
-    classifier = _get_classifier()
-    config = _get_config()
-    thresholds, calibrated = segment_scoring.resolve_thresholds(config)
+    scorer = _paragraph_scorer()
 
     with _inference_slot():
         results = segment_scoring.score_segments(
             [(segment.id, segment.text) for segment in body.segments],
-            classifier,
-            lambda batch: _build_feature_batch(batch, config),
-            thresholds,
+            scorer.predict,
+            scorer.thresholds,
             debug=os.environ.get("DETECTION_DEBUG", "").strip().lower() in ("1", "true", "yes"),
         )
 
     return {
-        "model_version": _get_model_version(config),
-        "calibrated": calibrated,
-        "thresholds": thresholds,
+        "model_version": scorer.model_version,
+        "calibrated": scorer.calibrated,
+        "thresholds": scorer.thresholds,
         "segments": results,
     }
 
@@ -525,14 +583,13 @@ def score_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detecti
 @app.get("/v2/model-info")
 def model_info(_: None = Depends(_verify_detection_api_key)):
     """Which model is serving, where its bands are drawn, and how much one request may carry."""
-    _get_classifier()
-    config = _get_config()
-    thresholds, calibrated = segment_scoring.resolve_thresholds(config)
+    scorer = _paragraph_scorer()
     return {
-        "model_version": _get_model_version(config),
-        "calibrated": calibrated,
-        "thresholds": thresholds,
-        "uses_perplexity": _model_learned_from_perplexity(config),
+        "model_version": scorer.model_version,
+        "model_type": scorer.model_type,
+        "calibrated": scorer.calibrated,
+        "thresholds": scorer.thresholds,
+        "uses_perplexity": scorer.uses_perplexity,
         "limits": {
             "max_segments": segment_scoring.MAX_SEGMENTS,
             "max_total_chars": segment_scoring.MAX_TOTAL_CHARS,

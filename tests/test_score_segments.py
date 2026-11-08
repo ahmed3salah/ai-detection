@@ -1,8 +1,10 @@
 """/v2/score-segments: the HTTP contract the backend relies on, and batch/single feature parity."""
 import json
 import os
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -39,6 +41,10 @@ class ScoreSegmentsApiTest(unittest.TestCase):
         patcher = patch.object(app_module, "_model_version", "test-model")
         patcher.start()
         self.addCleanup(patcher.stop)
+        # These tests drive the v1 fallback; ParagraphModelApiTest covers a deployed paragraph model.
+        paragraph = patch.object(app_module, "_get_segment_model", return_value=None)
+        paragraph.start()
+        self.addCleanup(paragraph.stop)
 
     def post(self, segments, **extra):
         return self.client.post("/v2/score-segments", json={"segments": segments, **extra})
@@ -214,6 +220,64 @@ class ScoreSegmentsApiTest(unittest.TestCase):
             self.post(self.segments(1))
 
         self.assertNotIn("corpora", "\n".join(logs.output))
+
+
+class FakeParagraphModel:
+    config = {"model_version": "scibert-test", "classifier_type": "transformer", "segment_thresholds": {"likely_ai": 0.8, "possibly_ai": 0.1}}
+
+    def __init__(self, probabilities):
+        self.probabilities = probabilities
+
+    def predict(self, texts):
+        return np.array(self.probabilities[: len(texts)]), list(range(len(texts)))
+
+
+class ParagraphModelApiTest(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app_module.app)
+        # A deployed paragraph model replaces the v1 classifier for v2 entirely.
+        v1 = patch.object(app_module, "_get_classifier", side_effect=AssertionError("v1 classifier used"))
+        v1.start()
+        self.addCleanup(v1.stop)
+
+    def post(self, count):
+        return self.client.post("/v2/score-segments", json={"segments": [{"id": i, "text": f"{i} {PARAGRAPH}"} for i in range(count)]})
+
+    def test_serves_the_paragraph_model_with_its_own_version_and_calibrated_bands(self):
+        with patch.object(app_module, "_get_segment_model", return_value=FakeParagraphModel([0.9, 0.5, 0.05])):
+            body = self.post(3).json()
+
+        self.assertEqual(body["model_version"], "scibert-test")
+        self.assertIs(body["calibrated"], True)
+        self.assertEqual(body["thresholds"], {"likely_ai": 0.8, "possibly_ai": 0.1})
+        self.assertEqual([s["band"] for s in body["segments"]], ["likely_ai", "possibly_ai", "human"])
+
+    def test_model_info_describes_the_paragraph_model(self):
+        with patch.object(app_module, "_get_segment_model", return_value=FakeParagraphModel([])):
+            body = self.client.get("/v2/model-info").json()
+
+        self.assertEqual(body["model_version"], "scibert-test")
+        self.assertEqual(body["model_type"], "transformer")
+        self.assertIs(body["calibrated"], True)
+        self.assertIs(body["uses_perplexity"], False)
+
+    def test_a_deployed_model_that_will_not_load_is_a_503_never_a_fallback_to_v1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "model_config.pkl").write_text("not a pickle")
+            with patch.object(app_module, "SEGMENT_MODEL_DIR", Path(directory)), patch.object(
+                app_module, "_segment_model", None
+            ), self.assertLogs("app", level="ERROR"):
+                response = self.post(1)
+                ready = self.client.get("/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(ready.status_code, 503)
+
+    def test_without_a_deployed_model_v2_falls_back_to_v1(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app_module, "SEGMENT_MODEL_DIR", Path(directory)), patch.object(
+            app_module, "_segment_model", None
+        ):
+            self.assertIsNone(app_module._get_segment_model())
 
 
 class DockerImageTest(unittest.TestCase):

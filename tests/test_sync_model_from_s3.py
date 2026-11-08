@@ -18,7 +18,7 @@ _SPEC.loader.exec_module(_mod)
 class TestSyncModelFromS3(unittest.TestCase):
     def test_skip_when_not_configured(self):
         with patch.dict(os.environ):
-            for k in ("MODEL_S3_URI", "MODEL_S3_BUCKET", "MODEL_S3_PREFIX", "MODEL_SYNC_DEST"):
+            for k in ("MODEL_S3_URI", "MODEL_S3_BUCKET", "MODEL_S3_PREFIX", "MODEL_SYNC_DEST", "PARAGRAPH_MODEL_S3_URI"):
                 os.environ.pop(k, None)
             self.assertEqual(_mod.main(), 0)
 
@@ -76,6 +76,74 @@ class TestSyncModelFromS3(unittest.TestCase):
                 self.assertEqual(_mod.main(), 0)
 
         mock_client.download_file.assert_called_once_with("b", "model.pkl", str(tmp / "model.pkl"))
+
+    def paragraph_client(self, keys, fail_on=None):
+        client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"Contents": [{"Key": key} for key in keys]}]
+        client.get_paginator.return_value = paginator
+
+        def download(bucket, key, path):
+            if key == fail_on:
+                from botocore.exceptions import ClientError
+
+                raise ClientError({"Error": {"Code": "500"}}, "GetObject")
+            Path(path).write_text(key)
+
+        client.download_file.side_effect = download
+        return client
+
+    def sync_paragraph_model(self, client, dest):
+        env = {"PARAGRAPH_MODEL_S3_URI": "s3://b/paragraph/scibert-full-1108/", "PARAGRAPH_MODEL_SYNC_DEST": str(dest)}
+        with patch.dict(os.environ, env, clear=True):
+            mock_boto = MagicMock()
+            mock_boto.client.return_value = client
+            with patch.object(_mod, "boto3", mock_boto):
+                return _mod.main()
+
+    def test_paragraph_model_keeps_its_folder_layout(self):
+        dest = Path(self._temp_dest()) / "paragraph_model"
+        client = self.paragraph_client([
+            "paragraph/scibert-full-1108/model_config.pkl",
+            "paragraph/scibert-full-1108/calibrator.pkl",
+            "paragraph/scibert-full-1108/model/config.json",
+            "paragraph/scibert-full-1108/model/model.safetensors",
+        ])
+
+        self.assertEqual(self.sync_paragraph_model(client, dest), 0)
+
+        self.assertEqual(
+            sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()),
+            ["calibrator.pkl", "model/config.json", "model/model.safetensors", "model_config.pkl"],
+        )
+
+    def test_paragraph_model_failed_download_leaves_the_old_model_in_place(self):
+        dest = Path(self._temp_dest()) / "paragraph_model"
+        dest.mkdir()
+        (dest / "model_config.pkl").write_text("old")
+        client = self.paragraph_client(
+            ["paragraph/scibert-full-1108/model_config.pkl", "paragraph/scibert-full-1108/model/model.safetensors"],
+            fail_on="paragraph/scibert-full-1108/model/model.safetensors",
+        )
+
+        self.assertEqual(self.sync_paragraph_model(client, dest), 1)
+
+        self.assertEqual((dest / "model_config.pkl").read_text(), "old")
+        self.assertEqual([p.name for p in dest.parent.iterdir()], ["paragraph_model"])
+
+    def test_paragraph_model_refuses_keys_that_climb_out_of_the_folder(self):
+        dest = Path(self._temp_dest()) / "paragraph_model"
+        client = self.paragraph_client(["paragraph/scibert-full-1108/model_config.pkl", "paragraph/scibert-full-1108/../../evil.py"])
+
+        self.assertEqual(self.sync_paragraph_model(client, dest), 1)
+        self.assertFalse(dest.exists())
+
+    def test_paragraph_model_without_its_config_is_refused(self):
+        dest = Path(self._temp_dest()) / "paragraph_model"
+        client = self.paragraph_client(["paragraph/scibert-full-1108/model/config.json"])
+
+        self.assertEqual(self.sync_paragraph_model(client, dest), 1)
+        self.assertFalse(dest.exists())
 
     def _temp_dest(self) -> str:
         import tempfile

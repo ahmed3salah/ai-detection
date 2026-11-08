@@ -16,12 +16,20 @@ Environment:
 
 Default: only downloads known inference basenames (model.pt, model.pkl, model_config.pkl, …).
 Set MODEL_S3_ALLOW_ANY=1 to download every object under the prefix (basename written to dest; collisions overwrite).
+
+The paragraph model /v2/score-segments serves is a whole directory (model/config.json, model/model.safetensors,
+calibrator.pkl, model_config.pkl …) and has its own model_config.pkl, so it syncs separately, folder layout kept:
+
+  PARAGRAPH_MODEL_S3_URI     s3://bucket/prefix of one train_transformer.py artifacts directory
+  PARAGRAPH_MODEL_SYNC_DEST  destination directory (default: paragraph_model, which app.py reads)
 """
 from __future__ import annotations
 
 import os
+import shutil
 import sys
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
@@ -108,7 +116,74 @@ def _download_one(
     return True
 
 
+def sync_paragraph_model() -> int:
+    """
+    Download one paragraph model directory. It lands next to the old one first and replaces it only
+    when every file arrived, so a failed sync never leaves the app half a model.
+    """
+    uri = (os.environ.get("PARAGRAPH_MODEL_S3_URI") or "").strip()
+    if not uri:
+        return 0
+    try:
+        bucket, prefix = _parse_s3_uri(uri)
+    except ValueError as e:
+        print(f"sync_model_from_s3: PARAGRAPH_MODEL_S3_URI: {e}", file=sys.stderr)
+        return 1
+    if not prefix:
+        print("sync_model_from_s3: PARAGRAPH_MODEL_S3_URI needs a prefix, the model's own folder.", file=sys.stderr)
+        return 1
+
+    dest = Path(os.environ.get("PARAGRAPH_MODEL_SYNC_DEST") or "paragraph_model").resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    kwargs: dict = {}
+    region = (os.environ.get("MODEL_S3_REGION") or "").strip()
+    if region:
+        kwargs["region_name"] = region
+    client = boto3.client("s3", **kwargs)
+
+    staging = Path(tempfile.mkdtemp(prefix=f".{dest.name}-", dir=dest.parent))
+    try:
+        list_prefix = prefix + "/"
+        downloaded = 0
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=list_prefix):
+            for obj in page.get("Contents", []):
+                key = obj.get("Key") or ""
+                relative = PurePosixPath(key[len(list_prefix):])
+                if key.endswith("/") or not relative.parts:
+                    continue
+                if relative.is_absolute() or ".." in relative.parts:
+                    print(f"sync_model_from_s3: refusing s3://{bucket}/{key}: it climbs out of the model folder.", file=sys.stderr)
+                    return 1
+                out_path = staging.joinpath(*relative.parts)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                print(f"sync_model_from_s3: downloading s3://{bucket}/{key} -> {dest / relative}")
+                client.download_file(bucket, key, str(out_path))
+                downloaded += 1
+        if not (staging / "model_config.pkl").exists():
+            print(f"sync_model_from_s3: s3://{bucket}/{list_prefix} has no model_config.pkl; not a paragraph model.", file=sys.stderr)
+            return 1
+        if dest.exists():
+            shutil.rmtree(dest)
+        staging.rename(dest)
+        print(f"sync_model_from_s3: paragraph model done ({downloaded} file(s)).")
+        return 0
+    except NoCredentialsError:
+        print("sync_model_from_s3: no AWS credentials for the paragraph model (see MODEL_S3_URI notes).", file=sys.stderr)
+        return 1
+    except (ClientError, BotoCoreError) as e:
+        print(f"sync_model_from_s3: S3 error syncing the paragraph model: {e}", file=sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def main() -> int:
+    v1 = sync_inference_files()
+    paragraph = sync_paragraph_model()
+    return v1 or paragraph
+
+
+def sync_inference_files() -> int:
     resolved = _resolve_bucket_prefix()
     if resolved is None:
         print("sync_model_from_s3: MODEL_S3_URI / MODEL_S3_BUCKET not set; skipping.")

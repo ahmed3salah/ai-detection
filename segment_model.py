@@ -91,7 +91,7 @@ class SegmentModel:
         if self.is_transformer:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-            from train_transformer import pick_device
+            from transformer_inference import pick_device
 
             self.device = pick_device(device)
             self.tokenizer = AutoTokenizer.from_pretrained(self.directory / "model")
@@ -110,7 +110,7 @@ class SegmentModel:
         """Calibrated P(AI) for the texts that could be measured, and each one's index into texts."""
         normalized = [normalize_segment(text) for text in texts]
         if self.is_transformer:
-            from train_transformer import predict_raw
+            from transformer_inference import predict_raw
 
             kept = [i for i, text in enumerate(normalized) if text]
             if not kept:
