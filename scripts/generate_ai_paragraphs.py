@@ -58,6 +58,9 @@ TRAINING_MODELS = [
 HELDOUT_MODELS = ["moonshotai/kimi-k3.1-pro", "z-ai/glm-5.3"]
 
 LENGTH_BUCKETS = ((40, 80), (80, 120), (120, 180), (180, 300))
+# Some arXiv papers are theses with 200+ paragraphs; uncapped, one of them would supply dozens of
+# targets and its author's style would weigh like many papers'.
+MAX_TARGETS_PER_PAPER = 12
 WORD_TOLERANCE = 0.3
 TOKENS_PER_WORD = 1.5
 MAX_TOKENS_FACTOR = 3
@@ -126,16 +129,29 @@ def select_targets(rows: Sequence[Dict], count: int, seed: int) -> List[Dict]:
         for low, high in LENGTH_BUCKETS:
             if low <= words < high or (high == LENGTH_BUCKETS[-1][1] and words == high):
                 buckets[(low, high)].append(row)
+    per_paper: Dict[str, int] = defaultdict(int)
+
+    def take(members: Sequence[Dict], limit: int) -> Tuple[List[Dict], List[Dict]]:
+        taken, rest = [], []
+        for row in members:
+            if len(taken) < limit and per_paper[row["paper_id"]] < MAX_TARGETS_PER_PAPER:
+                per_paper[row["paper_id"]] += 1
+                taken.append(row)
+            else:
+                rest.append(row)
+        return taken, rest
+
     picked: List[Dict] = []
     each = count // len(LENGTH_BUCKETS)
     leftovers: List[Dict] = []
     for bucket in LENGTH_BUCKETS:
         members = sorted(buckets[bucket], key=lambda row: row["id"])
         rng.shuffle(members)
-        picked.extend(members[:each])
-        leftovers.extend(members[each:])
+        taken, rest = take(members, each)
+        picked.extend(taken)
+        leftovers.extend(rest)
     rng.shuffle(leftovers)
-    return picked + leftovers[: max(0, count - len(picked))]
+    return picked + take(leftovers, max(0, count - len(picked)))[0]
 
 
 def choose_model(row: Dict, seed: int, training_models: Sequence[str], heldout_models: Sequence[str]) -> str:

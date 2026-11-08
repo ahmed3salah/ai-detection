@@ -682,6 +682,17 @@ class WholeDocumentTest(unittest.TestCase):
             self.assertFalse(test_only & {r["paper_id"] for r in splits[name]})
 
 
+class TargetCapTest(unittest.TestCase):
+    def test_no_paper_supplies_more_than_its_share_of_targets(self):
+        text = " ".join(["word"] * 90) + "."
+        rows = [{"id": f"thesis-{i}", "paper_id": "thesis", "text": text, "position": i} for i in range(200)]
+        rows += [{"id": f"p{p}-{i}", "paper_id": f"p{p}", "text": text, "position": i} for p in range(10) for i in range(3)]
+        picked = gen.select_targets(rows, 100, 42)
+        self.assertEqual(sum(row["paper_id"] == "thesis" for row in picked), gen.MAX_TARGETS_PER_PAPER)
+        self.assertEqual(len(picked), gen.MAX_TARGETS_PER_PAPER + 30)
+        self.assertEqual(len({row["id"] for row in picked}), len(picked))
+
+
 render = load_script("render_check")
 
 
