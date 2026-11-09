@@ -584,8 +584,9 @@ def score_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detecti
 def explain_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detection_api_key)):
     """
     For each paragraph, the sentences that raise its score the most: each sentence is left out
-    in turn and the paragraph re-scored, so the evidence is measured on the model itself. The
-    caller sends only the paragraphs it wants explained, usually the flagged ones.
+    in turn and the paragraph re-scored, so the evidence is measured on the model itself. Plus
+    every sentence's own score, read in a window of its neighbours. The caller sends only the
+    paragraphs it wants explained, usually the flagged ones.
 
     Only a deployed paragraph model explains; without one this answers 404, which callers read
     as "no evidence available".
@@ -601,14 +602,20 @@ def explain_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detec
 
     scorer = _paragraph_scorer()
 
+    pairs = [(segment.id, segment.text) for segment in body.segments]
     with _inference_slot():
         results = segment_scoring.explain_segments(
-            [(segment.id, segment.text) for segment in body.segments],
+            pairs,
             getattr(paragraph_model, "evidence_scores", scorer.predict),
             calibrate=getattr(paragraph_model, "calibrated_from_evidence", None),
             likely_threshold=scorer.thresholds.get("likely_ai"),
             lexicon=getattr(paragraph_model, "wording", []),
         )
+        # Each sentence's own score, in a window of its neighbours, on the paragraph bands.
+        sentences = segment_scoring.score_sentences(pairs, scorer.predict, scorer.thresholds)
+
+    for result, scored in zip(results, sentences):
+        result["sentences"] = scored
 
     return {"model_version": scorer.model_version, "segments": results}
 

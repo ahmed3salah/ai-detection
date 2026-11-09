@@ -142,6 +142,14 @@ SPREAD_ABOVE_EVEN = 0.2
 # At most this many AI-typical words or phrases are pointed out in one paragraph.
 WORDING_MAX_MATCHES = 6
 
+# A sentence is scored inside a window of its neighbours holding at least this many words: on a
+# lone sentence the model false-alarms far more than on the paragraph-length text it was
+# measured on. Measured on scibert-full-1108's test split (scripts/evaluate_sentence_scores.py,
+# 6,000 paragraphs): at 40, 0.9% of human sentences read as likely AI and 85% of AI ones do; in
+# paragraphs half human, half AI, 81% of the AI half and 8% of the human half are caught. At 20
+# the AI half fell to 63%; at 60 the human half rose to 13%, as windows reach across the seam.
+SENTENCE_WINDOW_MIN_WORDS = 40
+
 
 def sentence_spans(text: str) -> List[Tuple[int, int]]:
     """(start, end) character ranges of the text's sentences, trimmed of surrounding space."""
@@ -292,4 +300,82 @@ def explain_segments(
             "explain_ok": True,
         })
 
+    return results
+
+
+def sentence_windows(text: str, spans: Sequence[Tuple[int, int]], min_words: int = SENTENCE_WINDOW_MIN_WORDS) -> List[Tuple[int, int]]:
+    """
+    For each sentence, the (start, end) character range of the smallest run of sentences around
+    it holding at least `min_words` words: it grows by one neighbour at a time, the next one
+    first, then the one before, until it is long enough or holds the whole paragraph.
+    """
+    words = [len(text[begin:end].split()) for begin, end in spans]
+    windows: List[Tuple[int, int]] = []
+    for index in range(len(spans)):
+        low = high = index
+        count = words[index]
+        grow_after = True
+        while count < min_words and (low > 0 or high < len(spans) - 1):
+            if (grow_after and high < len(spans) - 1) or low == 0:
+                high += 1
+                count += words[high]
+            else:
+                low -= 1
+                count += words[low]
+            grow_after = not grow_after
+        windows.append((spans[low][0], spans[high][1]))
+    return windows
+
+
+def score_sentences(
+    segments: Sequence[Tuple[Any, str]],
+    predict: Callable[[List[str]], Tuple[np.ndarray, List[int]]],
+    thresholds: Dict[str, float],
+    min_words: int = SENTENCE_WINDOW_MIN_WORDS,
+) -> List[List[Dict[str, Any]]]:
+    """
+    A score for every sentence of each paragraph: the calibrated score of the sentence's window
+    (sentence_windows), banded on the paragraph thresholds. A paragraph shorter than one window
+    gives each sentence the paragraph's own score. One list per segment, in order; empty where
+    a paragraph could not be scored, and all empty if the model fails.
+    """
+    windows_by_segment: List[List[Tuple[int, int, Tuple[int, int]]]] = []
+    unique: Dict[str, int] = {}
+    window_texts: List[str] = []
+
+    for _, text in segments:
+        if len(text.strip()) > MAX_SEGMENT_CHARS:
+            windows_by_segment.append([])
+            continue
+        spans = sentence_spans(text)
+        entries = []
+        for (begin, end), (low, high) in zip(spans, sentence_windows(text, spans, min_words)):
+            window = text[low:high]
+            if window not in unique:
+                unique[window] = len(window_texts)
+                window_texts.append(window)
+            entries.append((begin, end, (low, high)))
+        windows_by_segment.append(entries)
+
+    if not window_texts:
+        return [[] for _ in segments]
+
+    try:
+        probabilities, kept = predict(window_texts)
+    except Exception:
+        logger.exception("Sentence scoring failed for a batch of %d segments", len(segments))
+        return [[] for _ in segments]
+
+    by_window = {kept_index: float(probabilities[row]) for row, kept_index in enumerate(kept)}
+    results: List[List[Dict[str, Any]]] = []
+    for (_, text), entries in zip(segments, windows_by_segment):
+        sentences = []
+        for begin, end, (low, high) in entries:
+            probability = by_window.get(unique[text[low:high]])
+            if probability is None or not math.isfinite(probability):
+                sentences = []
+                break
+            probability = min(1.0, max(0.0, probability))
+            sentences.append({"start": begin, "end": end, "ai_probability": round(probability, 4), "band": band_for(probability, thresholds)})
+        results.append(sentences)
     return results

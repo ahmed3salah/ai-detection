@@ -362,6 +362,65 @@ class SentenceEvidenceTest(unittest.TestCase):
         self.assertEqual(len(segment_scoring.wording_matches(" ".join(["underscores"] * 10), lexicon)), segment_scoring.WORDING_MAX_MATCHES)
 
 
+class SentenceScoreTest(unittest.TestCase):
+    THRESHOLDS = {"likely_ai": 0.8, "possibly_ai": 0.5}
+
+    @staticmethod
+    def sentence(words, marker=""):
+        return "Word " + " ".join(["word"] * (words - 1 - (1 if marker else 0)) + ([marker] if marker else [])) + "."
+
+    def test_a_window_grows_by_neighbours_next_first_until_long_enough(self):
+        text = " ".join(self.sentence(15) for _ in range(5))
+        spans = segment_scoring.sentence_spans(text)
+        windows = segment_scoring.sentence_windows(text, spans, min_words=40)
+
+        # 15 words each: a sentence needs two neighbours to reach 40.
+        self.assertEqual(windows[0], (spans[0][0], spans[2][1]))
+        self.assertEqual(windows[2], (spans[1][0], spans[3][1]))
+        self.assertEqual(windows[4], (spans[2][0], spans[4][1]))
+
+    def test_a_short_paragraph_window_is_the_whole_paragraph_and_a_long_sentence_stands_alone(self):
+        short = "One short sentence. Another short one."
+        spans = segment_scoring.sentence_spans(short)
+        self.assertEqual(segment_scoring.sentence_windows(short, spans), [(0, len(short))] * 2)
+
+        long_one = self.sentence(45) + " " + self.sentence(5)
+        spans = segment_scoring.sentence_spans(long_one)
+        self.assertEqual(segment_scoring.sentence_windows(long_one, spans)[0], spans[0])
+
+    def test_scores_each_sentence_by_its_window_on_the_paragraph_bands(self):
+        text = " ".join([self.sentence(45), self.sentence(45, "AIWORD"), self.sentence(45)])
+        [sentences] = segment_scoring.score_sentences([("p", text)], marker_predict, self.THRESHOLDS)
+
+        self.assertEqual([s["band"] for s in sentences], ["human", "likely_ai", "human"])
+        self.assertEqual([s["ai_probability"] for s in sentences], [0.1, 0.9, 0.1])
+        self.assertIn("AIWORD", text[sentences[1]["start"]:sentences[1]["end"]])
+        self.assertEqual([(s["start"], s["end"]) for s in sentences], segment_scoring.sentence_spans(text))
+
+    def test_a_one_sentence_paragraph_gets_the_paragraph_score_and_identical_windows_score_once(self):
+        calls = []
+
+        def counting(texts):
+            calls.append(list(texts))
+            return marker_predict(texts)
+
+        results = segment_scoring.score_sentences([("a", "Only one AIWORD sentence"), ("b", "Short. Pair.")], counting, self.THRESHOLDS)
+
+        self.assertEqual(results[0], [{"start": 0, "end": 24, "ai_probability": 0.9, "band": "likely_ai"}])
+        self.assertEqual([s["band"] for s in results[1]], ["human", "human"])
+        self.assertEqual(calls, [["Only one AIWORD sentence", "Short. Pair."]])
+
+    def test_a_model_failure_or_unscored_window_leaves_the_paragraph_without_sentences(self):
+        def broken(texts):
+            raise RuntimeError("boom")
+
+        with self.assertLogs("segment_scoring", level="ERROR"):
+            self.assertEqual(segment_scoring.score_sentences([("a", "One. Two.")], broken, self.THRESHOLDS), [[]])
+
+        nothing = lambda texts: (np.zeros(0), [])
+        self.assertEqual(segment_scoring.score_sentences([("a", "One. Two.")], nothing, self.THRESHOLDS), [[]])
+
+
 class ExplainApiTest(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app_module.app)
@@ -381,6 +440,7 @@ class ExplainApiTest(unittest.TestCase):
 
         self.assertEqual(body["model_version"], "scibert-test")
         self.assertEqual(body["segments"][0]["evidence"][0]["start"], 26)
+        self.assertEqual([(s["start"], s["band"]) for s in body["segments"][0]["sentences"]], [(0, "likely_ai"), (26, "likely_ai")])
 
 
 class DockerImageTest(unittest.TestCase):

@@ -101,6 +101,10 @@ class TransformerTrainingTest(unittest.TestCase):
         for result, segment in zip(explained["segments"], segments):
             for span in result["evidence"]:
                 self.assertTrue(0 <= span["start"] < span["end"] <= len(segment["text"]))
+            self.assertTrue(result["sentences"])
+            for sentence in result["sentences"]:
+                self.assertTrue(0 <= sentence["start"] < sentence["end"] <= len(segment["text"]))
+                self.assertIn(sentence["band"], {"likely_ai", "possibly_ai", "human"})
 
     def test_refuses_to_overwrite_and_leaves_nothing_after_a_crash(self):
         with self.assertRaisesRegex(ts.TrainingAborted, "never overwritten"):
