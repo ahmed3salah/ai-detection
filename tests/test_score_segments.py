@@ -327,7 +327,39 @@ class SentenceEvidenceTest(unittest.TestCase):
         with self.assertLogs("segment_scoring", level="ERROR"):
             results = segment_scoring.explain_segments([("a", "One. Two AIWORD.")], broken)
 
-        self.assertEqual(results, [{"id": "a", "evidence": [], "explain_ok": False}])
+        self.assertEqual(results, [{"id": "a", "evidence": [], "spread": None, "wording": [], "explain_ok": False}])
+
+    def test_tells_a_concentrated_signal_from_one_running_through_the_paragraph(self):
+        concentrated = "A plain opening sentence. Then the AIWORD sentence here. A plain closing one."
+        spread_out = "AIWORD one here. AIWORD two here. AIWORD three here."
+        flat = lambda texts: (np.array([0.3 * t.count("AIWORD") for t in texts]), list(range(len(texts))))
+        results = segment_scoring.explain_segments([("c", concentrated), ("s", spread_out)], flat)
+
+        self.assertEqual(results[0]["spread"]["kind"], "concentrated")
+        self.assertEqual(results[0]["spread"]["concentration"], 1.0)
+        self.assertEqual(results[1]["spread"]["kind"], "throughout")
+
+    def test_says_whether_the_paragraph_reads_as_likely_ai_without_any_one_sentence(self):
+        text = "AIWORD one here. AIWORD two here. AIWORD three here."
+        # Log-odds of 1.0 per marker, calibrated by a plain sigmoid.
+        score = lambda texts: (np.array([1.0 * t.count("AIWORD") for t in texts]), list(range(len(texts))))
+        calibrate = lambda z: 1 / (1 + np.exp(-z))
+        holds = segment_scoring.explain_segments([("p", text)], score, calibrate=calibrate, likely_threshold=0.8)[0]["spread"]
+        breaks = segment_scoring.explain_segments([("p", text)], score, calibrate=calibrate, likely_threshold=0.9)[0]["spread"]
+
+        self.assertIs(holds["holds_without_any"], True)
+        self.assertIs(breaks["holds_without_any"], False)
+
+    def test_points_out_ai_typical_wording_strongest_first_without_overlaps(self):
+        lexicon = [
+            {"phrase": phrase, "ratio": ratio, "pattern": segment_scoring.compile_phrase(phrase)}
+            for phrase, ratio in [("underscores the", 36.5), ("underscores", 20.0), ("across diverse", 205.9)]
+        ]
+        text = "This Underscores the gains across\ndiverse settings, and it underscores more."
+        matches = segment_scoring.wording_matches(text, lexicon)
+
+        self.assertEqual([(text[m["start"]:m["end"]], m["ratio"]) for m in matches], [("Underscores the", 36.5), ("across\ndiverse", 205.9), ("underscores", 20.0)])
+        self.assertEqual(len(segment_scoring.wording_matches(" ".join(["underscores"] * 10), lexicon)), segment_scoring.WORDING_MAX_MATCHES)
 
 
 class ExplainApiTest(unittest.TestCase):

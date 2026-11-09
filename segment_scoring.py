@@ -133,6 +133,15 @@ _ABBREVIATIONS = {"al", "fig", "figs", "eq", "eqs", "ref", "refs", "sec", "tab",
 EVIDENCE_MIN_SHARE = 0.25
 EVIDENCE_MAX_SENTENCES = 2
 
+# A paragraph's signal is "concentrated" when its top two sentences carry at least this share of
+# the drop, and that share is at least SPREAD_ABOVE_EVEN more than an even spread would give
+# them (or its top sentence alone stands that far, plus 0.1, above its even share).
+SPREAD_CONCENTRATED_SHARE = 0.6
+SPREAD_ABOVE_EVEN = 0.2
+
+# At most this many AI-typical words or phrases are pointed out in one paragraph.
+WORDING_MAX_MATCHES = 6
+
 
 def sentence_spans(text: str) -> List[Tuple[int, int]]:
     """(start, end) character ranges of the text's sentences, trimmed of surrounding space."""
@@ -157,9 +166,61 @@ def sentence_spans(text: str) -> List[Tuple[int, int]]:
     return trimmed
 
 
+def compile_phrase(phrase: str) -> "re.Pattern[str]":
+    """A phrase matched as whole words, case-insensitively, with any whitespace between its words."""
+    return re.compile(r"(?<![A-Za-z])" + r"\s+".join(re.escape(word) for word in phrase.split()) + r"(?![A-Za-z])", re.IGNORECASE)
+
+
+def wording_matches(text: str, lexicon: Sequence[Dict[str, Any]], limit: int = WORDING_MAX_MATCHES) -> List[Dict[str, Any]]:
+    """
+    Where the text uses wording far more common in AI-written text: character ranges with the
+    phrase and how many times more common it is. The strongest win where matches overlap.
+    """
+    found: List[Dict[str, Any]] = []
+    for term in sorted(lexicon, key=lambda item: -item["ratio"]):
+        for match in term["pattern"].finditer(text):
+            if any(match.start() < kept["end"] and kept["start"] < match.end() for kept in found):
+                continue
+            found.append({"start": match.start(), "end": match.end(), "phrase": term["phrase"], "ratio": term["ratio"]})
+            if len(found) >= limit:
+                return sorted(found, key=lambda item: item["start"])
+    return sorted(found, key=lambda item: item["start"])
+
+
+def signal_spread(full: float, drops: Sequence[float], without: Sequence[float], likely_threshold: Optional[float]) -> Optional[Dict[str, Any]]:
+    """
+    How a paragraph's signal is spread: concentrated in a sentence or two, or through all of it,
+    and whether it still reads as likely AI whichever single sentence is left out.
+
+    `drops` are each sentence's fall in the comparison score; `without` the paragraph's
+    calibrated score with that sentence left out.
+    """
+    positive = sorted((drop for drop in drops if drop > 0), reverse=True)
+    total = sum(positive)
+    if not drops:
+        return None
+    concentration = positive[0] / total if total > 0 else 0.0
+    top_two = sum(positive[:2]) / total if total > 0 else 0.0
+    # Against what an even spread over this many sentences would give: in a three-sentence
+    # paragraph any two sentences carry two thirds of the drop without standing out.
+    count = len(drops)
+    concentrated = (top_two >= SPREAD_CONCENTRATED_SHARE and top_two - min(1.0, 2 / count) >= SPREAD_ABOVE_EVEN) or (
+        concentration - 1 / count >= SPREAD_ABOVE_EVEN + 0.1
+    )
+    return {
+        "kind": "concentrated" if concentrated else "throughout",
+        "concentration": round(concentration, 3),
+        "holds_without_any": bool(likely_threshold is not None and without and min(without) >= likely_threshold),
+    }
+
+
 def explain_segments(
     segments: Sequence[Tuple[Any, str]],
     score: Callable[[List[str]], Tuple[np.ndarray, List[int]]],
+    *,
+    calibrate: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    likely_threshold: Optional[float] = None,
+    lexicon: Sequence[Dict[str, Any]] = (),
 ) -> List[Dict[str, Any]]:
     """
     The sentences that raise each paragraph's score the most, measured, not guessed: every
@@ -191,17 +252,23 @@ def explain_segments(
         without, without_kept = score(variants) if variants else (np.zeros(0), [])
     except Exception:
         logger.exception("Explaining failed for a batch of %d segments", len(texts))
-        return [{"id": segment_id, "evidence": [], "explain_ok": False} for segment_id, _ in segments]
+        return [{"id": segment_id, "evidence": [], "spread": None, "wording": [], "explain_ok": False} for segment_id, _ in segments]
 
     full_by_index = {kept: float(full[row]) for row, kept in enumerate(full_kept)}
     without_by_variant = {kept: float(without[row]) for row, kept in enumerate(without_kept)}
 
     drops: Dict[int, List[Tuple[int, int, float]]] = {}
+    all_drops: Dict[int, List[float]] = {}
+    without_scores: Dict[int, List[float]] = {}
     for variant, (index, (begin, end)) in enumerate(owners):
         if index not in full_by_index or variant not in without_by_variant:
             continue
         drop = full_by_index[index] - without_by_variant[variant]
-        if math.isfinite(drop) and drop > 0:
+        if not math.isfinite(drop):
+            continue
+        all_drops.setdefault(index, []).append(drop)
+        without_scores.setdefault(index, []).append(without_by_variant[variant])
+        if drop > 0:
             drops.setdefault(index, []).append((begin, end, drop))
 
     for index, (segment_id, _) in enumerate(segments):
@@ -213,6 +280,16 @@ def explain_segments(
             if total > 0 and drop / total >= EVIDENCE_MIN_SHARE
         ]
         strongest = sorted(shares, key=lambda span: -span["contribution"])[:EVIDENCE_MAX_SENTENCES]
-        results.append({"id": segment_id, "evidence": sorted(strongest, key=lambda span: span["start"]), "explain_ok": True})
+        without = without_scores.get(index, [])
+        if without and calibrate is not None:
+            without = [float(value) for value in calibrate(np.array(without))]
+        spread = signal_spread(full_by_index.get(index, 0.0), all_drops.get(index, []), without, likely_threshold) if index in full_by_index else None
+        results.append({
+            "id": segment_id,
+            "evidence": sorted(strongest, key=lambda span: span["start"]),
+            "spread": spread,
+            "wording": wording_matches(segments[index][1], lexicon) if lexicon else [],
+            "explain_ok": True,
+        })
 
     return results

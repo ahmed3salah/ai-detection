@@ -2,6 +2,7 @@
 The feature sets a paragraph model can be trained on, and a trained model read back from its
 artifacts directory.
 """
+import json
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -80,6 +81,16 @@ def feature_names(feature_set: str) -> List[str]:
     return list(FEATURE_SETS[feature_set][1])
 
 
+def load_wording(path: Path) -> List[Dict]:
+    """The wording list with each phrase compiled, or [] when the model has none."""
+    if not path.exists():
+        return []
+    from segment_scoring import compile_phrase
+
+    terms = json.loads(path.read_text(encoding="utf-8")).get("terms", [])
+    return [{"phrase": term["phrase"], "ratio": float(term["ratio"]), "pattern": compile_phrase(term["phrase"])} for term in terms]
+
+
 class SegmentModel:
     """A trained paragraph model, feature-based or transformer: texts in, calibrated probabilities out."""
 
@@ -87,6 +98,9 @@ class SegmentModel:
         self.directory = Path(directory)
         self.config = joblib.load(self.directory / "model_config.pkl")
         self.calibrator = joblib.load(self.directory / "calibrator.pkl")
+        # Words and phrases far more common in AI-written text, built with the model
+        # (scripts/build_wording_lexicon.py). Optional: without the file, no wording cue.
+        self.wording = load_wording(self.directory / "wording.json")
         self.is_transformer = self.config.get("classifier_type") == "transformer"
         if self.is_transformer:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -105,6 +119,12 @@ class SegmentModel:
     @property
     def thresholds(self) -> Dict[str, float]:
         return self.config["segment_thresholds"]
+
+    def calibrated_from_evidence(self, values: np.ndarray) -> np.ndarray:
+        """Evidence scores back on the calibrated scale the bands are drawn on."""
+        if not self.is_transformer:
+            return np.asarray(values, dtype=np.float64)
+        return self.calibrator.predict(1.0 / (1.0 + np.exp(-np.asarray(values, dtype=np.float64))))
 
     def evidence_scores(self, texts: Sequence[str]) -> Tuple[np.ndarray, List[int]]:
         """

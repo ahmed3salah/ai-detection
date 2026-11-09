@@ -605,6 +605,9 @@ def explain_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detec
         results = segment_scoring.explain_segments(
             [(segment.id, segment.text) for segment in body.segments],
             getattr(paragraph_model, "evidence_scores", scorer.predict),
+            calibrate=getattr(paragraph_model, "calibrated_from_evidence", None),
+            likely_threshold=scorer.thresholds.get("likely_ai"),
+            lexicon=getattr(paragraph_model, "wording", []),
         )
 
     return {"model_version": scorer.model_version, "segments": results}
