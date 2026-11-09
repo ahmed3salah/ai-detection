@@ -280,6 +280,77 @@ class ParagraphModelApiTest(unittest.TestCase):
             self.assertIsNone(app_module._get_segment_model())
 
 
+def marker_predict(texts):
+    """A model that scores a text 0.9 when it holds the marker word, 0.1 otherwise."""
+    return np.array([0.9 if "AIWORD" in text else 0.1 for text in texts]), list(range(len(texts)))
+
+
+class SentenceEvidenceTest(unittest.TestCase):
+    def test_splits_sentences_without_breaking_abbreviations(self):
+        text = "We measure the yield (Fig. 2). As Smith et al. Showed, it holds.  Done?"
+        self.assertEqual(
+            [text[a:b] for a, b in segment_scoring.sentence_spans(text)],
+            ["We measure the yield (Fig. 2).", "As Smith et al. Showed, it holds.", "Done?"],
+        )
+
+    def test_names_the_sentence_whose_removal_lowers_the_score_with_its_exact_range(self):
+        text = "A plain opening sentence. Then the AIWORD sentence here. A plain closing one."
+        [result] = segment_scoring.explain_segments([("p1", text)], marker_predict)
+
+        self.assertIs(result["explain_ok"], True)
+        self.assertEqual(len(result["evidence"]), 1)
+        span = result["evidence"][0]
+        self.assertEqual(text[span["start"]:span["end"]], "Then the AIWORD sentence here.")
+        self.assertEqual(span["contribution"], 1.0)
+
+    def test_a_signal_spread_evenly_names_none(self):
+        text = "First plain sentence. Second plain sentence. Third plain sentence. Fourth plain sentence. Fifth one."
+        even = lambda texts: (np.array([len(t) / 100 for t in texts]), list(range(len(texts))))
+        [result] = segment_scoring.explain_segments([("p", text)], even)
+
+        self.assertEqual(result["evidence"], [])
+
+    def test_a_single_sentence_has_no_evidence_and_at_most_two_are_named(self):
+        one = "Only one AIWORD sentence"
+        many = "AIWORD one. AIWORD two. AIWORD three."
+        flat = lambda texts: (np.array([0.9 if t.count("AIWORD") >= 3 else 0.2 for t in texts]), list(range(len(texts))))
+        results = segment_scoring.explain_segments([("a", one), ("b", many)], flat)
+
+        self.assertEqual(results[0]["evidence"], [])
+        self.assertEqual(len(results[1]["evidence"]), 2)
+        self.assertLess(results[1]["evidence"][0]["start"], results[1]["evidence"][1]["start"])
+
+    def test_a_model_failure_marks_every_paragraph_unexplained(self):
+        def broken(texts):
+            raise RuntimeError("boom")
+
+        with self.assertLogs("segment_scoring", level="ERROR"):
+            results = segment_scoring.explain_segments([("a", "One. Two AIWORD.")], broken)
+
+        self.assertEqual(results, [{"id": "a", "evidence": [], "explain_ok": False}])
+
+
+class ExplainApiTest(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app_module.app)
+
+    def post(self, texts):
+        return self.client.post("/v2/explain-segments", json={"segments": [{"id": i, "text": text} for i, text in enumerate(texts)]})
+
+    def test_without_a_paragraph_model_there_is_nothing_to_explain(self):
+        with patch.object(app_module, "_get_segment_model", return_value=None):
+            self.assertEqual(self.post(["One. Two."]).status_code, 404)
+
+    def test_explains_with_the_paragraph_model(self):
+        model = FakeParagraphModel([])
+        model.predict = marker_predict
+        with patch.object(app_module, "_get_segment_model", return_value=model):
+            body = self.post(["A plain opening sentence. Then the AIWORD sentence here."]).json()
+
+        self.assertEqual(body["model_version"], "scibert-test")
+        self.assertEqual(body["segments"][0]["evidence"][0]["start"], 26)
+
+
 class DockerImageTest(unittest.TestCase):
     def test_the_image_copies_every_local_module_the_app_imports(self):
         """The Dockerfile names its modules; one left out crashes the container on boot."""

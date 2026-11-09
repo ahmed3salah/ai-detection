@@ -31,14 +31,26 @@ def encode(tokenizer, texts: Sequence[str], max_length: int) -> Dict[str, torch.
     )
 
 
-def predict_raw(model, tokenizer, texts: Sequence[str], max_length: int, device: torch.device, batch_size: int = 32) -> np.ndarray:
-    """P(AI) before calibration, in the order given."""
+def _logits(model, tokenizer, texts: Sequence[str], max_length: int, device: torch.device, batch_size: int) -> torch.Tensor:
     model.eval()
-    out: List[float] = []
+    out: List[torch.Tensor] = []
     with torch.inference_mode():
         for start in range(0, len(texts), batch_size):
             batch = {k: v.to(device) for k, v in encode(tokenizer, texts[start : start + batch_size], max_length).items()}
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits = model(**batch).logits
-            out.extend(torch.softmax(logits.float(), dim=-1)[:, 1].cpu().tolist())
-    return np.array(out, dtype=np.float64)
+                out.append(model(**batch).logits.float().cpu())
+    return torch.cat(out) if out else torch.zeros((0, 2))
+
+
+def predict_raw(model, tokenizer, texts: Sequence[str], max_length: int, device: torch.device, batch_size: int = 32) -> np.ndarray:
+    """P(AI) before calibration, in the order given."""
+    return torch.softmax(_logits(model, tokenizer, texts, max_length, device, batch_size), dim=-1)[:, 1].numpy().astype(np.float64)
+
+
+def predict_log_odds(model, tokenizer, texts: Sequence[str], max_length: int, device: torch.device, batch_size: int = 32) -> np.ndarray:
+    """
+    The model's log-odds of AI, in the order given. Unlike a probability it doesn't flatten near
+    0 and 1, so it still moves when one sentence of a strongly flagged paragraph is left out.
+    """
+    logits = _logits(model, tokenizer, texts, max_length, device, batch_size)
+    return (logits[:, 1] - logits[:, 0]).numpy().astype(np.float64)

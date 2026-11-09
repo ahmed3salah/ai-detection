@@ -87,6 +87,7 @@ class TransformerTrainingTest(unittest.TestCase):
             client = TestClient(app_module.app)
             body = client.post("/v2/score-segments", json={"segments": segments}).json()
             info = client.get("/v2/model-info").json()
+            explained = client.post("/v2/explain-segments", json={"segments": segments}).json()
 
         self.assertEqual(body["model_version"], "tiny")
         self.assertIs(body["calibrated"], True)
@@ -95,6 +96,11 @@ class TransformerTrainingTest(unittest.TestCase):
         self.assertTrue(by_id["h"]["scoring_ok"] and by_id["a"]["scoring_ok"])
         self.assertLess(by_id["h"]["ai_probability"], by_id["a"]["ai_probability"])
         self.assertEqual(info["model_type"], "transformer")
+        self.assertEqual([s["id"] for s in explained["segments"]], ["h", "a"])
+        self.assertTrue(all(s["explain_ok"] for s in explained["segments"]))
+        for result, segment in zip(explained["segments"], segments):
+            for span in result["evidence"]:
+                self.assertTrue(0 <= span["start"] < span["end"] <= len(segment["text"]))
 
     def test_refuses_to_overwrite_and_leaves_nothing_after_a_crash(self):
         with self.assertRaisesRegex(ts.TrainingAborted, "never overwritten"):

@@ -580,6 +580,36 @@ def score_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detecti
     }
 
 
+@app.post("/v2/explain-segments")
+def explain_segments(body: ScoreSegmentsRequest, _: None = Depends(_verify_detection_api_key)):
+    """
+    For each paragraph, the sentences that raise its score the most: each sentence is left out
+    in turn and the paragraph re-scored, so the evidence is measured on the model itself. The
+    caller sends only the paragraphs it wants explained, usually the flagged ones.
+
+    Only a deployed paragraph model explains; without one this answers 404, which callers read
+    as "no evidence available".
+    """
+    texts = [segment.text for segment in body.segments]
+    too_big = segment_scoring.request_limit_error(texts)
+    if too_big is not None:
+        raise HTTPException(status_code=413, detail=too_big)
+
+    paragraph_model = _get_segment_model()
+    if paragraph_model is None:
+        raise HTTPException(status_code=404, detail="Explanations need a deployed paragraph model.")
+
+    scorer = _paragraph_scorer()
+
+    with _inference_slot():
+        results = segment_scoring.explain_segments(
+            [(segment.id, segment.text) for segment in body.segments],
+            getattr(paragraph_model, "evidence_scores", scorer.predict),
+        )
+
+    return {"model_version": scorer.model_version, "segments": results}
+
+
 @app.get("/v2/model-info")
 def model_info(_: None = Depends(_verify_detection_api_key)):
     """Which model is serving, where its bands are drawn, and how much one request may carry."""

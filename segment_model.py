@@ -106,6 +106,22 @@ class SegmentModel:
     def thresholds(self) -> Dict[str, float]:
         return self.config["segment_thresholds"]
 
+    def evidence_scores(self, texts: Sequence[str]) -> Tuple[np.ndarray, List[int]]:
+        """
+        What sentence evidence compares: a transformer's log-odds, which keep moving where
+        calibrated probabilities flatten out; a feature model's calibrated probability.
+        """
+        if not self.is_transformer:
+            return self.predict(texts)
+
+        from transformer_inference import predict_log_odds
+
+        normalized = [normalize_segment(text) for text in texts]
+        kept = [i for i, text in enumerate(normalized) if text]
+        if not kept:
+            return np.zeros(0), []
+        return predict_log_odds(self.classifier, self.tokenizer, [texts[i] for i in kept], self.config["max_length"], self.device), kept
+
     def predict(self, texts: Sequence[str]) -> Tuple[np.ndarray, List[int]]:
         """Calibrated P(AI) for the texts that could be measured, and each one's index into texts."""
         normalized = [normalize_segment(text) for text in texts]

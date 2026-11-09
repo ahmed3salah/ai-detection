@@ -8,6 +8,7 @@ a failed segment has no probability, rather than a 0.0 that reads as "human".
 import logging
 import math
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -119,3 +120,99 @@ def score_segments(
         }
 
     return results  # type: ignore[return-value]
+
+
+# A sentence ends at ., ! or ? followed by space and a capital or an opening bracket or quote.
+# "e.g. the" stays one sentence because a lowercase word follows; the abbreviations below are
+# never an end, so "Fig. 2" and "et al. Smith" stay whole too.
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+(?=[A-Z(\[\"'])")
+_ABBREVIATIONS = {"al", "fig", "figs", "eq", "eqs", "ref", "refs", "sec", "tab", "no", "vs", "cf", "e.g", "i.e", "approx", "dr", "prof", "mr", "ms", "st"}
+
+# Evidence settings: a sentence is named when it carries at least this share of everything the
+# paragraph's score drops by across its sentences, and at most this many are named.
+EVIDENCE_MIN_SHARE = 0.25
+EVIDENCE_MAX_SENTENCES = 2
+
+
+def sentence_spans(text: str) -> List[Tuple[int, int]]:
+    """(start, end) character ranges of the text's sentences, trimmed of surrounding space."""
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    for match in _SENTENCE_END.finditer(text):
+        before = text[start:match.start()].rstrip(".!?").split()
+        if before and before[-1].lower().lstrip("([") in _ABBREVIATIONS:
+            continue
+        spans.append((start, match.start() + len(match.group(0).rstrip())))
+        start = match.end()
+    spans.append((start, len(text)))
+
+    trimmed = []
+    for begin, end in spans:
+        while begin < end and text[begin].isspace():
+            begin += 1
+        while end > begin and text[end - 1].isspace():
+            end -= 1
+        if end > begin:
+            trimmed.append((begin, end))
+    return trimmed
+
+
+def explain_segments(
+    segments: Sequence[Tuple[Any, str]],
+    score: Callable[[List[str]], Tuple[np.ndarray, List[int]]],
+) -> List[Dict[str, Any]]:
+    """
+    The sentences that raise each paragraph's score the most, measured, not guessed: every
+    sentence is left out in turn and the paragraph re-scored. A sentence's contribution is its
+    share (0-1) of the total drop across the paragraph's sentences, so a paragraph whose signal
+    sits in one sentence names that one, and one whose signal is spread evenly names none.
+    A paragraph of one sentence has no evidence.
+
+    `score` should not flatten near the ends (log-odds rather than a calibrated probability), or
+    a strongly flagged paragraph barely moves whichever sentence is left out.
+
+    Character offsets index the text as sent, so the caller can underline those exact ranges.
+    """
+    results: List[Dict[str, Any]] = []
+    texts = [text for _, text in segments]
+    variants: List[str] = []
+    owners: List[Tuple[int, Tuple[int, int]]] = []
+
+    for index, text in enumerate(texts):
+        spans = sentence_spans(text)
+        if len(spans) < 2 or len(text.strip()) > MAX_SEGMENT_CHARS:
+            continue
+        for begin, end in spans:
+            variants.append(" ".join(part for part in (text[:begin].strip(), text[end:].strip()) if part))
+            owners.append((index, (begin, end)))
+
+    try:
+        full, full_kept = score(texts) if variants else (np.zeros(0), [])
+        without, without_kept = score(variants) if variants else (np.zeros(0), [])
+    except Exception:
+        logger.exception("Explaining failed for a batch of %d segments", len(texts))
+        return [{"id": segment_id, "evidence": [], "explain_ok": False} for segment_id, _ in segments]
+
+    full_by_index = {kept: float(full[row]) for row, kept in enumerate(full_kept)}
+    without_by_variant = {kept: float(without[row]) for row, kept in enumerate(without_kept)}
+
+    drops: Dict[int, List[Tuple[int, int, float]]] = {}
+    for variant, (index, (begin, end)) in enumerate(owners):
+        if index not in full_by_index or variant not in without_by_variant:
+            continue
+        drop = full_by_index[index] - without_by_variant[variant]
+        if math.isfinite(drop) and drop > 0:
+            drops.setdefault(index, []).append((begin, end, drop))
+
+    for index, (segment_id, _) in enumerate(segments):
+        found = drops.get(index, [])
+        total = sum(drop for _, _, drop in found)
+        shares = [
+            {"start": begin, "end": end, "contribution": round(drop / total, 3)}
+            for begin, end, drop in found
+            if total > 0 and drop / total >= EVIDENCE_MIN_SHARE
+        ]
+        strongest = sorted(shares, key=lambda span: -span["contribution"])[:EVIDENCE_MAX_SENTENCES]
+        results.append({"id": segment_id, "evidence": sorted(strongest, key=lambda span: span["start"]), "explain_ok": True})
+
+    return results

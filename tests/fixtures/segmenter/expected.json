@@ -9,7 +9,7 @@
         {
             "kind": "paragraph",
             "section": "1 Introduction",
-            "coords": "1,1,1,1,1",
+            "coords": "1,1,1,1,1;1,2,2,2,2",
             "text": "Short opener line. Retrieval systems rarely see the corpus they were tuned on for long [1], because documents arrive continuously and the distribution of queries shifts with them. Operators respond by rebuilding indexes on a schedule, yet rebuilds are expensive and the gains fade within weeks, so a cheaper way of keeping latency stable is worth having."
         },
         {

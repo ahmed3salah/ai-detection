@@ -123,6 +123,12 @@ def normalize_segments(segments: List[Segment]) -> List[Segment]:
     return result
 
 
+def join_coords(first: Optional[str], second: Optional[str]) -> Optional[str]:
+    """The page boxes of two paragraphs read as one, so a highlight on the PDF covers both."""
+    boxes = [coords for coords in (first, second) if coords]
+    return ";".join(boxes) if boxes else None
+
+
 def _same_block(a: Segment, b: Segment) -> bool:
     return a.kind == b.kind and a.section == b.section
 
@@ -134,7 +140,7 @@ def _merge_short(segments: List[Segment]) -> List[Segment]:
     for segment in segments:
         if carry is not None:
             if _same_block(carry, segment):
-                segment = Segment(segment.kind, f"{carry.text} {segment.text}", segment.section, carry.coords or segment.coords)
+                segment = Segment(segment.kind, f"{carry.text} {segment.text}", segment.section, join_coords(carry.coords, segment.coords))
             else:
                 merged = _append_or_join(merged, carry)
             carry = None
@@ -149,7 +155,7 @@ def _merge_short(segments: List[Segment]) -> List[Segment]:
 
 def _append_or_join(merged: List[Segment], short: Segment) -> List[Segment]:
     if merged and _same_block(merged[-1], short) and count_words(merged[-1].text) < SPLIT_ABOVE_WORDS:
-        merged[-1] = replace(merged[-1], text=f"{merged[-1].text} {short.text}")
+        merged[-1] = replace(merged[-1], text=f"{merged[-1].text} {short.text}", coords=join_coords(merged[-1].coords, short.coords))
         return merged
     merged.append(short)
     return merged
